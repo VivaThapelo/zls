@@ -1,16 +1,18 @@
 //! PLEASE READ THE FOLLOWING MESSAGE BEFORE EDITING THIS FILE:
 //!
 //! This build runner is targeting compatibility with the following Zig versions:
-//!   - 0.14.0
+//!   - 0.15.1 or later
 //!
-//! Handling multiple Zig versions can be achieved by branching on the `builtin.zig_version` at comptime.
+//! Handling multiple Zig versions can be achieved with one of the following strategies:
+//!   - use `@hasDecl` or `@hasField` (recommended)
+//!   - use `builtin.zig_version`
 //!
 //! You can test out the build runner on ZLS's `build.zig` with the following command:
-//! `zig build --build-runner src/build_runner/0.14.0.zig`
+//! `zig build --build-runner src/build_runner/build_runner.zig`
 //!
 //! You can also test the build runner on any other `build.zig` with the following command:
-//! `zig build --build-file /path/to/build.zig --build-runner /path/to/zls/src/build_runner/0.14.0.zig`
-//! `zig build --build-runner /path/to/zls/src/build_runner/0.14.0.zig` (if the cwd contains build.zig)
+//! `zig build --build-file /path/to/build.zig --build-runner /path/to/zls/src/build_runner/build_runner.zig`
+//! `zig build --build-runner /path/to/zls/src/build_runner/build_runner.zig` (if the cwd contains build.zig)
 //!
 
 const root = @import("@build");
@@ -19,17 +21,12 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const mem = std.mem;
 const process = std.process;
-const ArrayList = std.ArrayList;
+const ArrayListManaged = if (@hasDecl(std, "array_list")) std.array_list.Managed else std.ArrayList;
+const ArrayList = if (@hasDecl(std, "array_list")) std.ArrayList else std.ArrayList;
 const Step = std.Build.Step;
 const Allocator = std.mem.Allocator;
 
 pub const dependencies = @import("@dependencies");
-
-// ----------- List of Zig versions that introduced breaking changes -----------
-
-const add_embed_path_version = std.SemanticVersion.parse("0.15.0-dev.141+b5a526054") catch unreachable;
-
-// -----------------------------------------------------------------------------
 
 ///! This is a modified build runner to extract information out of build.zig
 ///! Modified version of lib/build_runner.zig
@@ -76,7 +73,7 @@ pub fn main() !void {
         .handle = try std.fs.cwd().makeOpenPath(global_cache_root, .{}),
     };
 
-    var graph: std.Build.Graph = .{
+    var graph = structInitIgnoreUnknown(std.Build.Graph, .{
         .arena = arena,
         .cache = .{
             .gpa = arena,
@@ -90,7 +87,8 @@ pub fn main() !void {
             .query = .{},
             .result = try std.zig.system.resolveTargetQuery(.{}),
         },
-    };
+        .time_report = false,
+    });
 
     graph.cache.addPrefix(.{ .path = null, .handle = std.fs.cwd() });
     graph.cache.addPrefix(build_root_directory);
@@ -105,8 +103,8 @@ pub fn main() !void {
         dependencies.root_deps,
     );
 
-    var targets = ArrayList([]const u8).init(arena);
-    var debug_log_scopes = ArrayList([]const u8).init(arena);
+    var targets = ArrayListManaged([]const u8).init(arena);
+    var debug_log_scopes = ArrayListManaged([]const u8).init(arena);
     var thread_pool_options: std.Thread.Pool.Options = .{ .allocator = arena };
 
     var install_prefix: ?[]const u8 = null;
@@ -219,8 +217,12 @@ pub fn main() !void {
                 // but it is handled by the parent process. The build runner
                 // only sees this flag.
                 graph.system_package_mode = true;
-            } else if (mem.eql(u8, arg, "--glibc-runtimes")) {
-                builder.glibc_runtimes_dir = nextArgOrFatal(args, &arg_idx);
+            } else if (mem.eql(u8, arg, "--libc-runtimes") or mem.eql(u8, arg, "--glibc-runtimes")) {
+                if (@hasField(std.Build, "glibc_runtimes_dir")) {
+                    builder.glibc_runtimes_dir = nextArgOrFatal(args, &arg_idx);
+                } else {
+                    builder.libc_runtimes_dir = nextArgOrFatal(args, &arg_idx);
+                }
             } else if (mem.eql(u8, arg, "--verbose-link")) {
                 builder.verbose_link = true;
             } else if (mem.eql(u8, arg, "--verbose-air")) {
@@ -316,7 +318,7 @@ pub fn main() !void {
     }
 
     if (graph.needed_lazy_dependencies.entries.len != 0) {
-        var buffer: std.ArrayListUnmanaged(u8) = .{};
+        var buffer: ArrayList(u8) = .{};
         for (graph.needed_lazy_dependencies.keys()) |k| {
             try buffer.appendSlice(arena, k);
             try buffer.append(arena, '\n');
@@ -329,8 +331,8 @@ pub fn main() !void {
             .data = buffer.items,
             .flags = .{ .exclusive = true },
         }) catch |err| {
-            fatal("unable to write configuration results to '{}{s}': {s}", .{
-                local_cache_directory, tmp_sub_path, @errorName(err),
+            fatal("unable to write configuration results to '{f}{s}': {}", .{
+                local_cache_directory, tmp_sub_path, err,
             });
         };
 
@@ -348,12 +350,12 @@ pub fn main() !void {
         .max_rss_is_default = false,
         .max_rss_mutex = .{},
         .skip_oom_steps = skip_oom_steps,
-        .memory_blocked_steps = std.ArrayList(*Step).init(arena),
+        .memory_blocked_steps = .init(arena),
         .thread_pool = undefined, // set below
 
         .claimed_rss = 0,
 
-        .transport = null,
+        .watch = watch,
         .cycle = 0,
     };
 
@@ -381,28 +383,24 @@ pub fn main() !void {
 
     const message_thread = try std.Thread.spawn(.{}, struct {
         fn do(ww: *Watch) void {
-            while (std.io.getStdIn().reader().readByte()) |tag| {
-                switch (tag) {
+            while (true) {
+                var buffer: [1]u8 = undefined;
+                var file_reader = std.fs.File.stdin().reader(&buffer);
+                const reader = &file_reader.interface;
+                const byte = reader.takeByte() catch |err| switch (err) {
+                    error.EndOfStream => process.exit(0),
+                    else => process.exit(1),
+                };
+                switch (byte) {
                     '\x00' => ww.trigger(),
                     else => process.exit(1),
                 }
-            } else |err| switch (err) {
-                error.EndOfStream => process.exit(0),
-                else => process.exit(1),
             }
         }
     }.do, .{&w});
     message_thread.detach();
 
     const gpa = arena;
-    var transport = Transport.init(.{
-        .gpa = gpa,
-        .in = std.io.getStdIn(),
-        .out = std.io.getStdOut(),
-    });
-    defer transport.deinit();
-
-    run.transport = &transport;
 
     var step_stack = try stepNamesToStepStack(gpa, builder, targets.items, check_step_only);
     if (step_stack.count() == 0) {
@@ -417,6 +415,7 @@ pub fn main() !void {
 
     rebuild: while (true) : (run.cycle += 1) {
         runSteps(
+            gpa,
             builder,
             &step_stack,
             main_progress_node,
@@ -516,12 +515,12 @@ const Run = struct {
     max_rss_is_default: bool,
     max_rss_mutex: std.Thread.Mutex,
     skip_oom_steps: bool,
-    memory_blocked_steps: std.ArrayList(*Step),
+    memory_blocked_steps: ArrayListManaged(*Step),
     thread_pool: std.Thread.Pool,
 
     claimed_rss: usize,
 
-    transport: ?*Transport,
+    watch: bool,
     cycle: u32,
 };
 
@@ -602,6 +601,7 @@ fn prepare(
 }
 
 fn runSteps(
+    gpa: std.mem.Allocator,
     b: *std.Build,
     steps_stack: *const std.AutoArrayHashMapUnmanaged(*Step, void),
     parent_prog_node: std.Progress.Node,
@@ -624,17 +624,17 @@ fn runSteps(
 
         wait_group.start();
         thread_pool.spawn(workerMakeOneStep, .{
-            &wait_group, b, steps_stack, step, step_prog, run,
+            &wait_group, gpa, b, steps_stack, step, step_prog, run,
         }) catch @panic("OOM");
     }
 
-    if (run.transport) |transport| {
+    if (run.watch) {
         for (steps) |step| {
             const step_id: u32 = @intCast(steps_stack.getIndex(step).?);
             // missing fields:
             // - result_error_msgs
             // - result_stderr
-            serveWatchErrorBundle(transport, step_id, run.cycle, step.result_error_bundle) catch @panic("failed to send watch errors");
+            serveWatchErrorBundle(step_id, run.cycle, step.result_error_bundle) catch @panic("failed to send watch errors");
         }
     }
 }
@@ -691,6 +691,7 @@ fn constructGraphAndCheckForDependencyLoop(
 
 fn workerMakeOneStep(
     wg: *std.Thread.WaitGroup,
+    gpa: std.mem.Allocator,
     b: *std.Build,
     steps_stack: *const std.AutoArrayHashMapUnmanaged(*Step, void),
     s: *Step,
@@ -750,18 +751,20 @@ fn workerMakeOneStep(
     var sub_prog_node = prog_node.start(s.name, 0);
     defer sub_prog_node.end();
 
-    const make_result = s.make(.{
+    const make_result = s.make(structInitIgnoreUnknown(std.Build.Step.MakeOptions, .{
         .progress_node = sub_prog_node,
         .thread_pool = thread_pool,
         .watch = true,
-    });
+        .gpa = gpa,
+        .web_server = null,
+    }));
 
-    if (run.transport) |transport| {
+    if (run.watch) {
         const step_id: u32 = @intCast(steps_stack.getIndex(s).?);
         // missing fields:
         // - result_error_msgs
         // - result_stderr
-        serveWatchErrorBundle(transport, step_id, run.cycle, s.result_error_bundle) catch @panic("failed to send watch errors");
+        serveWatchErrorBundle(step_id, run.cycle, s.result_error_bundle) catch @panic("failed to send watch errors");
     }
 
     handle_result: {
@@ -779,7 +782,7 @@ fn workerMakeOneStep(
         for (s.dependants.items) |dep| {
             wg.start();
             thread_pool.spawn(workerMakeOneStep, .{
-                wg, b, steps_stack, dep, prog_node, run,
+                wg, gpa, b, steps_stack, dep, prog_node, run,
             }) catch @panic("OOM");
         }
     }
@@ -805,7 +808,7 @@ fn workerMakeOneStep(
 
                 wg.start();
                 thread_pool.spawn(workerMakeOneStep, .{
-                    wg, b, steps_stack, dep, prog_node, run,
+                    wg, gpa, b, steps_stack, dep, prog_node, run,
                 }) catch @panic("OOM");
             } else {
                 run.memory_blocked_steps.items[i] = dep;
@@ -921,6 +924,7 @@ fn createModuleDependenciesForStep(step: *Step) Allocator.Error!void {
             .path_after,
             .framework_path,
             .framework_path_system,
+            .embed_path,
             => |lp| lp.addStepDependencies(step),
 
             .other_step => |other| {
@@ -928,15 +932,7 @@ fn createModuleDependenciesForStep(step: *Step) Allocator.Error!void {
                 step.dependOn(&other.step);
             },
 
-            else => {
-                const has_embed_path = comptime builtin.zig_version.order(add_embed_path_version) != .lt;
-                comptime assert(@typeInfo(std.Build.Module.IncludeDir).@"union".fields.len == @as(usize, 7) + @intFromBool(has_embed_path));
-                if (has_embed_path and include_dir == .embed_path) {
-                    include_dir.embed_path.addStepDependencies(step);
-                } else if (include_dir == .config_header_step) {
-                    step.dependOn(&include_dir.config_header_step.step);
-                } else unreachable;
-            },
+            .config_header_step => |config_header| step.dependOn(&config_header.step),
         };
         for (mod.lib_paths.items) |lp| lp.addStepDependencies(step);
         for (mod.rpaths.items) |rpath| switch (rpath) {
@@ -983,7 +979,7 @@ const Packages = struct {
     }
 
     pub fn toPackageList(self: *Packages) ![]BuildConfig.Package {
-        var result: std.ArrayListUnmanaged(BuildConfig.Package) = .{};
+        var result: ArrayList(BuildConfig.Package) = .{};
         errdefer result.deinit(self.allocator);
 
         const Context = struct {
@@ -1026,7 +1022,7 @@ fn extractBuildInformation(
 
     // collect the set of all steps
     {
-        var stack: std.ArrayListUnmanaged(*Step) = .{};
+        var stack: ArrayList(*Step) = .{};
         defer stack.deinit(gpa);
 
         try stack.ensureUnusedCapacity(gpa, b.top_level_steps.count());
@@ -1065,15 +1061,10 @@ fn extractBuildInformation(
                         try set.put(allocator, include_tree.generated_directory.step, {});
                     }
                 },
-                else => {
-                    const has_embed_path = comptime builtin.zig_version.order(add_embed_path_version) != .lt;
-                    comptime assert(@typeInfo(std.Build.Module.IncludeDir).@"union".fields.len == @as(usize, 7) + @intFromBool(has_embed_path));
-                    if (has_embed_path and include_dir == .embed_path) {
-                        // This only affects C source files
-                    } else if (include_dir == .config_header_step) {
-                        try set.put(allocator, include_dir.config_header_step.output_file.step, {});
-                    } else unreachable;
+                .embed_path => {
+                    // This only affects C source files
                 },
+                .config_header_step => |config_header| try set.put(allocator, &config_header.step, {}),
             }
         }
 
@@ -1140,20 +1131,15 @@ fn extractBuildInformation(
                             );
                         }
                     },
-                    else => {
-                        const has_embed_path = comptime builtin.zig_version.order(add_embed_path_version) != .lt;
-                        comptime assert(@typeInfo(std.Build.Module.IncludeDir).@"union".fields.len == @as(usize, 7) + @intFromBool(has_embed_path));
-                        if (has_embed_path and include_dir == .embed_path) {
-                            // This only affects C source files
-                        } else if (include_dir == .config_header_step) {
-                            const full_file_path = include_dir.config_header_step.output_file.getPath();
-                            const header_dir_path = full_file_path[0 .. full_file_path.len - include_dir.config_header_step.include_path.len];
-                            try include_dirs.put(
-                                allocator,
-                                header_dir_path,
-                                {},
-                            );
-                        } else unreachable;
+                    .embed_path => {
+                        // This only affects C source files
+                    },
+                    .config_header_step => |config_header| {
+                        try include_dirs.put(
+                            allocator,
+                            config_header.generated_dir.getPath(),
+                            {},
+                        );
                     },
                 }
             }
@@ -1196,6 +1182,7 @@ fn extractBuildInformation(
 
     // run all steps that are dependencies
     try runSteps(
+        gpa,
         b,
         &step_dependencies,
         main_progress_node,
@@ -1249,7 +1236,7 @@ fn extractBuildInformation(
     //     .{ "diffz", "122089a8247a693cad53beb161bde6c30f71376cd4298798d45b32740c3581405864" },
     // };
 
-    var deps_build_roots: std.ArrayListUnmanaged(BuildConfig.DepsBuildRoots) = .{};
+    var deps_build_roots: ArrayList(BuildConfig.DepsBuildRoots) = .{};
     for (dependencies.root_deps) |root_dep| {
         inline for (comptime std.meta.declarations(dependencies.packages)) |package| blk: {
             if (std.mem.eql(u8, package.name, root_dep[1])) {
@@ -1272,7 +1259,10 @@ fn extractBuildInformation(
         available_options.map.putAssumeCapacityNoClobber(available_option.key_ptr.*, available_option.value_ptr.*);
     }
 
-    try std.json.stringify(
+    const stringifyValueAlloc = if (@hasDecl(std.json, "Stringify")) std.json.Stringify.valueAlloc else std.json.stringifyAlloc;
+
+    const stringified_build_config = try stringifyValueAlloc(
+        gpa,
         BuildConfig{
             .deps_build_roots = deps_build_roots.items,
             .packages = try packages.toPackageList(),
@@ -1281,11 +1271,11 @@ fn extractBuildInformation(
             .available_options = available_options,
             .c_macros = c_macros.keys(),
         },
-        .{
-            .whitespace = .indent_2,
-        },
-        std.io.getStdOut().writer(),
+        .{ .whitespace = .indent_2 },
     );
+
+    var file_writer = std.fs.File.stdout().writer(&.{});
+    file_writer.interface.writeAll(stringified_build_config) catch return file_writer.err.?;
 }
 
 fn processPkgConfig(
@@ -1395,7 +1385,7 @@ const copied_from_zig = struct {
             else => return err,
         };
 
-        var zig_args = ArrayList([]const u8).init(b.allocator);
+        var zig_args = ArrayListManaged([]const u8).init(b.allocator);
         defer zig_args.deinit();
 
         var it = mem.tokenizeAny(u8, stdout, " \r\n\t");
@@ -1430,7 +1420,7 @@ const copied_from_zig = struct {
 
     fn execPkgConfigList(self: *std.Build, out_code: *u8) (std.Build.PkgConfigError || std.Build.RunError)![]const std.Build.PkgConfigPkg {
         const stdout = try self.runAllowFail(&.{ "pkg-config", "--list-all" }, out_code, .Ignore);
-        var list = ArrayList(std.Build.PkgConfigPkg).init(self.allocator);
+        var list = ArrayListManaged(std.Build.PkgConfigPkg).init(self.allocator);
         errdefer list.deinit();
         var line_it = mem.tokenizeAny(u8, stdout, "\r\n");
         while (line_it.next()) |line| {
@@ -1469,24 +1459,61 @@ const copied_from_zig = struct {
 };
 
 fn serveWatchErrorBundle(
-    transport: *Transport,
     step_id: u32,
     cycle: u32,
     error_bundle: std.zig.ErrorBundle,
-) !void {
-    const eb_hdr: shared.ServerToClient.ErrorBundle = .{
+) std.posix.WriteError!void {
+    const bytes_len = @sizeOf(shared.ServerToClient.ErrorBundle) + @sizeOf(u32) * error_bundle.extra.len + error_bundle.string_bytes.len;
+
+    var header: shared.ServerToClient.Header = .{
+        .tag = .watch_error_bundle,
+        .bytes_len = @intCast(bytes_len),
+    };
+
+    var error_bundle_header: shared.ServerToClient.ErrorBundle = .{
         .step_id = step_id,
         .cycle = cycle,
         .extra_len = @intCast(error_bundle.extra.len),
         .string_bytes_len = @intCast(error_bundle.string_bytes.len),
     };
-    const bytes_len = @sizeOf(shared.ServerToClient.ErrorBundle) + 4 * error_bundle.extra.len + error_bundle.string_bytes.len;
-    try transport.serveMessage(.{
-        .tag = @intFromEnum(shared.ServerToClient.Tag.watch_error_bundle),
-        .bytes_len = @intCast(bytes_len),
-    }, &.{
-        std.mem.asBytes(&eb_hdr),
+
+    const need_bswap = builtin.target.cpu.arch.endian() != .little;
+
+    if (need_bswap) {
+        std.mem.byteSwapAllFields(shared.ServerToClient.Header, &header);
+        std.mem.byteSwapAllFields(shared.ServerToClient.ErrorBundle, &error_bundle_header);
+        std.mem.byteSwapAllElements(u32, @constCast(error_bundle.extra)); // trust me bro
+    }
+
+    var file_writer = std.fs.File.stdout().writer(&.{});
+    const writer = &file_writer.interface;
+
+    var data = [_][]const u8{
+        std.mem.asBytes(&header),
+        std.mem.asBytes(&error_bundle_header),
         std.mem.sliceAsBytes(error_bundle.extra),
         error_bundle.string_bytes,
-    });
+    };
+    writer.writeVecAll(&data) catch return file_writer.err.?;
+}
+
+/// Initialize a struct with provided values. Any values that are unrecognized
+/// will be ignored.
+fn structInitIgnoreUnknown(T: type, init: anytype) T {
+    var result: T = undefined;
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (@hasField(@TypeOf(init), field.name)) {
+            switch (@typeInfo(field.type)) {
+                .@"struct" => {
+                    @field(result, field.name) = structInitIgnoreUnknown(field.type, @field(init, field.name));
+                },
+                else => {
+                    @field(result, field.name) = @field(init, field.name);
+                },
+            }
+        } else {
+            @field(result, field.name) = comptime field.defaultValue() orelse @compileError("missing struct field: " ++ field.name);
+        }
+    }
+    return result;
 }

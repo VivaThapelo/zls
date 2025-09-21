@@ -38,7 +38,14 @@ fn gotoDefinitionSymbol(
         .definition => try decl_handle.definitionToken(analyser, true),
         .type_definition => blk: {
             if (try decl_handle.resolveType(analyser)) |ty| {
-                if (try ty.typeDefinitionToken()) |token_handle| break :blk token_handle;
+                var resolved_ty = ty;
+                while (true) {
+                    resolved_ty =
+                        try analyser.resolveUnwrapErrorUnionType(resolved_ty, .payload) orelse
+                        try analyser.resolveDerefType(resolved_ty) orelse
+                        try analyser.resolveOptionalUnwrap(resolved_ty) orelse break;
+                }
+                if (try resolved_ty.typeDefinitionToken()) |token_handle| break :blk token_handle;
             }
             const type_declaration = try decl_handle.typeDeclarationNode() orelse return null;
 
@@ -88,10 +95,37 @@ fn gotoDefinitionGlobal(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    const name_loc = Analyser.identifierLocFromIndex(handle.tree, pos_index) orelse return null;
+    const name_token, const name_loc = Analyser.identifierTokenAndLocFromIndex(handle.tree, pos_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     const decl = (try analyser.lookupSymbolGlobal(handle, name, pos_index)) orelse return null;
-    return try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), decl, kind, offset_encoding);
+    return try gotoDefinitionSymbol(analyser, offsets.tokenToRange(handle.tree, name_token, offset_encoding), decl, kind, offset_encoding);
+}
+
+fn gotoDefinitionStructInit(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    source_index: usize,
+    kind: GotoKind,
+    offset_encoding: offsets.Encoding,
+) error{OutOfMemory}!?types.DefinitionLink {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    if (kind == .declaration) return null;
+
+    const token = offsets.sourceIndexToTokenIndex(handle.tree, source_index).pickPreferred(&.{.period}, &handle.tree) orelse return null;
+    if (token + 1 >= handle.tree.tokens.len) return null;
+    if (handle.tree.tokenTag(token + 1) != .l_brace) return null;
+
+    const resolved_type = try analyser.resolveStructInitType(handle, source_index) orelse return null;
+    const token_handle = try resolved_type.typeDefinitionToken() orelse return null;
+    const target_range = offsets.tokenToRange(token_handle.handle.tree, token_handle.token, offset_encoding);
+    return .{
+        .originSelectionRange = offsets.tokenToRange(handle.tree, token, offset_encoding),
+        .targetUri = token_handle.handle.uri,
+        .targetRange = target_range,
+        .targetSelectionRange = target_range,
+    };
 }
 
 fn gotoDefinitionEnumLiteral(
@@ -104,14 +138,16 @@ fn gotoDefinitionEnumLiteral(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    const name_loc = Analyser.identifierLocFromIndex(handle.tree, source_index) orelse return null;
+    const name_token, const name_loc = Analyser.identifierTokenAndLocFromIndex(handle.tree, source_index) orelse {
+        return gotoDefinitionStructInit(analyser, handle, source_index, kind, offset_encoding);
+    };
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     const decl = (try analyser.getSymbolEnumLiteral(handle, source_index, name)) orelse return null;
-    return try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), decl, kind, offset_encoding);
+    return try gotoDefinitionSymbol(analyser, offsets.tokenToRange(handle.tree, name_token, offset_encoding), decl, kind, offset_encoding);
 }
 
 fn gotoDefinitionBuiltin(
-    document_store: *DocumentStore,
+    analyser: *Analyser,
     handle: *DocumentStore.Handle,
     loc: offsets.Loc,
     offset_encoding: offsets.Encoding,
@@ -119,17 +155,19 @@ fn gotoDefinitionBuiltin(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    const name_loc = offsets.tokenIndexToLoc(handle.tree.source, loc.start);
-    const name = offsets.locToSlice(handle.tree.source, name_loc);
+    const tree = handle.tree;
+    const name_loc = offsets.tokenIndexToLoc(tree.source, loc.start);
+    const name = offsets.locToSlice(tree.source, name_loc);
     if (std.mem.eql(u8, name, "@cImport")) {
-        const tree = handle.tree;
+        if (!DocumentStore.supports_build_system) return null;
+
         const index = for (handle.cimports.items(.node), 0..) |cimport_node, index| {
             const main_token = tree.nodeMainToken(cimport_node);
             if (loc.start == tree.tokenStart(main_token)) break index;
         } else return null;
         const hash = handle.cimports.items(.hash)[index];
 
-        const result = document_store.cimports.get(hash) orelse return null;
+        const result = analyser.store.cimports.get(hash) orelse return null;
         const target_range: types.Range = .{
             .start = .{ .line = 0, .character = 0 },
             .end = .{ .line = 0, .character = 0 },
@@ -137,12 +175,23 @@ fn gotoDefinitionBuiltin(
         switch (result) {
             .failure => return null,
             .success => |uri| return .{
-                .originSelectionRange = offsets.locToRange(handle.tree.source, name_loc, offset_encoding),
+                .originSelectionRange = offsets.locToRange(tree.source, name_loc, offset_encoding),
                 .targetUri = uri,
                 .targetRange = target_range,
                 .targetSelectionRange = target_range,
             },
         }
+    } else if (std.mem.eql(u8, name, "@This")) {
+        const ty = try analyser.innermostContainer(handle, name_loc.start);
+        const definition = try ty.typeDefinitionToken() orelse return null;
+        const token_loc = offsets.tokenToLoc(tree, definition.token);
+        const target_range = offsets.locToRange(tree.source, token_loc, offset_encoding);
+        return .{
+            .originSelectionRange = offsets.locToRange(tree.source, name_loc, offset_encoding),
+            .targetUri = handle.uri,
+            .targetRange = target_range,
+            .targetSelectionRange = target_range,
+        };
     }
 
     return null;
@@ -160,14 +209,14 @@ fn gotoDefinitionFieldAccess(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    const name_loc = Analyser.identifierLocFromIndex(handle.tree, source_index) orelse return null;
+    const name_token, const name_loc = Analyser.identifierTokenAndLocFromIndex(handle.tree, source_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     const held_loc = offsets.locMerge(loc, name_loc);
     const accesses = (try analyser.getSymbolFieldAccesses(arena, handle, source_index, held_loc, name)) orelse return null;
-    var locs: std.ArrayListUnmanaged(types.DefinitionLink) = .empty;
+    var locs: std.ArrayList(types.DefinitionLink) = .empty;
 
     for (accesses) |access| {
-        if (try gotoDefinitionSymbol(analyser, offsets.locToRange(handle.tree.source, name_loc, offset_encoding), access, kind, offset_encoding)) |l|
+        if (try gotoDefinitionSymbol(analyser, offsets.tokenToRange(handle.tree, name_token, offset_encoding), access, kind, offset_encoding)) |l|
             try locs.append(arena, l);
     }
 
@@ -198,8 +247,10 @@ fn gotoDefinitionString(
         .cinclude_string_literal => try URI.fromPath(
             arena,
             blk: {
+                if (!DocumentStore.supports_build_system) return null;
+
                 if (std.fs.path.isAbsolute(import_str)) break :blk import_str;
-                var include_dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+                var include_dirs: std.ArrayList([]const u8) = .empty;
                 _ = document_store.collectIncludeDirs(arena, handle, &include_dirs) catch |err| {
                     log.err("failed to resolve include paths: {}", .{err});
                     return null;
@@ -236,14 +287,14 @@ pub fn gotoHandler(
     const handle = server.document_store.getHandle(request.textDocument.uri) orelse return null;
     if (handle.tree.mode == .zon) return null;
 
-    var analyser = server.initAnalyser(handle);
+    var analyser = server.initAnalyser(arena, handle);
     defer analyser.deinit();
 
     const source_index = offsets.positionToIndex(handle.tree.source, request.position, server.offset_encoding);
     const pos_context = try Analyser.getPositionContext(arena, handle.tree, source_index, true);
 
     const response = switch (pos_context) {
-        .builtin => |loc| try gotoDefinitionBuiltin(&server.document_store, handle, loc, server.offset_encoding),
+        .builtin => |loc| try gotoDefinitionBuiltin(&analyser, handle, loc, server.offset_encoding),
         .var_access => try gotoDefinitionGlobal(&analyser, handle, source_index, kind, server.offset_encoding),
         .field_access => |loc| blk: {
             const links = try gotoDefinitionFieldAccess(&analyser, arena, handle, source_index, loc, kind, server.offset_encoding) orelse return null;

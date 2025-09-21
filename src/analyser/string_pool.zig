@@ -37,7 +37,7 @@ pub fn StringPool(comptime config: Config) type {
                 return @enumFromInt(@intFromEnum(self));
             }
 
-            pub fn fmt(self: String, pool: *Pool) std.fmt.Formatter(print) {
+            pub fn fmt(self: String, pool: *Pool) std.fmt.Alt(FormatContext, print) {
                 return .{ .data = .{ .string = self, .pool = pool } };
             }
         };
@@ -156,9 +156,7 @@ pub fn StringPool(comptime config: Config) type {
         /// equal strings are guaranteed to share the same storage
         ///
         /// only callable when thread safety is disabled.
-        pub const stringToSlice = if (config.thread_safe) @"usingnamespace" else stringToSliceUnsafe;
-
-        const @"usingnamespace" = {};
+        pub const stringToSlice = if (config.thread_safe) {} else stringToSliceUnsafe;
 
         /// returns the underlying slice from an interned string
         /// equal strings are guaranteed to share the same storage
@@ -170,7 +168,7 @@ pub fn StringPool(comptime config: Config) type {
         }
 
         mutex: MutexType,
-        bytes: std.ArrayListUnmanaged(u8),
+        bytes: std.ArrayList(u8),
         map: std.HashMapUnmanaged(u32, void, std.hash_map.StringIndexContext, std.hash_map.default_max_load_percentage),
 
         pub const empty: Pool = .{
@@ -202,8 +200,7 @@ pub fn StringPool(comptime config: Config) type {
             pool: *Pool,
         };
 
-        fn print(ctx: FormatContext, comptime fmt_str: []const u8, _: std.fmt.FormatOptions, writer: anytype) @TypeOf(writer).Error!void {
-            if (fmt_str.len != 0) std.fmt.invalidFmtError(fmt_str, ctx.string);
+        fn print(ctx: FormatContext, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             const locked_string = ctx.pool.stringToSliceLock(ctx.string);
             defer locked_string.release(ctx.pool);
             try writer.writeAll(locked_string.slice);
@@ -213,7 +210,7 @@ pub fn StringPool(comptime config: Config) type {
 
 /// same as `std.hash_map.StringIndexAdapter` but the hash of the adapted key is precomputed
 const PrecomputedStringIndexAdapter = struct {
-    bytes: *const std.ArrayListUnmanaged(u8),
+    bytes: *const std.ArrayList(u8),
     adapted_key: []const u8,
     precomputed_key_hash: u64,
 
@@ -242,7 +239,7 @@ test StringPool {
 
         try std.testing.expectEqualStrings(str, locked_string.slice);
     }
-    try std.testing.expectFmt(str, "{}", .{index.fmt(&pool)});
+    try std.testing.expectFmt(str, "{f}", .{index.fmt(&pool)});
 }
 
 test "StringPool - check interning" {

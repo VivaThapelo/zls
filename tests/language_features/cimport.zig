@@ -68,7 +68,7 @@ test "cUndef" {
 }
 
 fn testConvertCInclude(cimport_source: []const u8, expected: []const u8) !void {
-    const source: [:0]u8 = try std.fmt.allocPrintZ(allocator, "const c = {s};", .{cimport_source});
+    const source: [:0]u8 = try std.fmt.allocPrintSentinel(allocator, "const c = {s};", .{cimport_source}, 0);
     defer allocator.free(source);
 
     var tree: Ast = try .parse(allocator, source, .zig);
@@ -111,7 +111,7 @@ fn testTranslate(c_source: []const u8) !translate_c.Result {
 
     var result = (try translate_c.translate(
         allocator,
-        zls.DocumentStore.Config.fromMainConfig(ctx.server.config),
+        ctx.server.document_store.config,
         &.{},
         &.{},
         c_source,
@@ -120,7 +120,7 @@ fn testTranslate(c_source: []const u8) !translate_c.Result {
 
     switch (result) {
         .success => |uri| {
-            const path = try zls.URI.parse(allocator, uri);
+            const path = try zls.URI.toFsPath(allocator, uri);
             defer allocator.free(path);
             try std.testing.expect(std.fs.path.isAbsolute(path));
             try std.fs.accessAbsolute(path, .{});

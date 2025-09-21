@@ -15,23 +15,29 @@ pub fn renderToFile(
     tree: Ast,
     options: RenderOptions,
     file: std.fs.File,
-) (std.fs.File.WriteError || std.mem.Allocator.Error)!void {
-    var bw = std.io.bufferedWriter(file.writer());
-    try renderToWriter(tree, options, bw.writer());
-    try bw.flush();
+) (std.fs.File.WriteError || std.fs.File.SetEndPosError || std.mem.Allocator.Error)!void {
+    var buffer: [4096]u8 = undefined;
+    var file_writer = file.writer(&buffer);
+    renderToWriter(tree, options, &file_writer.interface) catch |err| switch (err) {
+        error.WriteFailed => return file_writer.err.?,
+    };
+    file_writer.end() catch |err| switch (err) {
+        error.WriteFailed => return file_writer.err.?,
+        else => |e| return e,
+    };
 }
 
 pub fn renderToWriter(
     tree: Ast,
     options: RenderOptions,
-    writer: anytype,
-) (@TypeOf(writer).Error || std.mem.Allocator.Error)!void {
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!void {
     var p: PrintAst = .{
-        .w = writer.any(),
+        .w = writer,
         .tree = tree,
         .options = options,
     };
-    return @errorCast(p.renderRoot());
+    return try p.renderRoot();
 }
 
 pub fn fmt(tree: Ast, options: RenderOptions) Formatter {
@@ -43,19 +49,17 @@ pub const Formatter = struct {
     options: RenderOptions,
 
     pub fn format(
-        self: @This(),
+        ctx: Formatter,
+        writer: *std.Io.Writer,
         comptime fmt_spec: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
     ) !void {
-        if (fmt_spec.len != 0) return std.fmt.invalidFmtError(fmt_spec, self.tree);
-        _ = options;
-        try renderToWriter(self.tree, self.options, writer);
+        comptime std.debug.assert(fmt_spec.len == 0);
+        try renderToWriter(ctx.tree, ctx.options, writer);
     }
 };
 
 const PrintAst = struct {
-    w: std.io.AnyWriter,
+    w: *std.Io.Writer,
     tree: Ast,
     options: RenderOptions,
     indent: u32 = 0,
@@ -63,12 +67,12 @@ const PrintAst = struct {
     current_column: usize = 0,
     current_source_index: usize = 0,
 
-    fn renderRoot(p: *PrintAst) anyerror!void {
+    fn renderRoot(p: *PrintAst) std.Io.Writer.Error!void {
         try p.renderNode(.root);
         try p.w.writeByte('\n');
     }
 
-    fn renderOptNode(p: *PrintAst, opt_node: Ast.Node.OptionalIndex) anyerror!void {
+    fn renderOptNode(p: *PrintAst, opt_node: Ast.Node.OptionalIndex) std.Io.Writer.Error!void {
         if (opt_node.unwrap()) |node| {
             try p.renderNode(node);
         } else {
@@ -76,7 +80,7 @@ const PrintAst = struct {
         }
     }
 
-    fn renderNode(p: *PrintAst, node: Ast.Node.Index) anyerror!void {
+    fn renderNode(p: *PrintAst, node: Ast.Node.Index) std.Io.Writer.Error!void {
         const tree = p.tree;
         const tag = tree.nodeTag(node);
 
@@ -100,7 +104,7 @@ const PrintAst = struct {
             .identifier,
             .enum_literal,
             .string_literal,
-            => return try p.w.print(".{s}({s})", .{ @tagName(tag), tree.tokenSlice(tree.nodeMainToken(node)) }),
+            => return try p.w.print(".{t}({s})", .{ tag, tree.tokenSlice(tree.nodeMainToken(node)) }),
             .error_value => return try p.w.print(".error_value({s})", .{tree.tokenSlice(tree.nodeMainToken(node) + 2)}),
             .multiline_string_literal => {
                 try p.w.writeAll(".multiline_string_literal(");
@@ -135,7 +139,7 @@ const PrintAst = struct {
             else => {},
         }
 
-        try p.w.print("{}{{", .{std.zig.fmtId(nodeTagName(tag))});
+        try p.w.print("{f}{{", .{std.zig.fmtId(nodeTagName(tag))});
         p.indent += 1;
         switch (tag) {
             .@"catch",
@@ -209,9 +213,7 @@ const PrintAst = struct {
             .negation_wrap,
             .address_of,
             .@"try",
-            .@"await",
             .deref,
-            .@"usingnamespace",
             .@"suspend",
             .@"resume",
             .@"comptime",
@@ -305,7 +307,7 @@ const PrintAst = struct {
             .ptr_type_bit_range,
             => {
                 const pointer_type = tree.fullPtrType(node).?;
-                try p.renderCustomField("{}", .{pointer_type.size}, "size");
+                try p.renderCustomField("{t}", .{pointer_type.size}, "size");
                 try p.renderOptTokenField(pointer_type.allowzero_token, "allowzero_token", .hide_if_none);
                 try p.renderOptTokenField(pointer_type.const_token, "const_token", .hide_if_none);
                 try p.renderOptTokenField(pointer_type.volatile_token, "volatile_token", .hide_if_none);
@@ -357,16 +359,11 @@ const PrintAst = struct {
             },
             .call_one,
             .call_one_comma,
-            .async_call_one,
-            .async_call_one_comma,
             .call,
             .call_comma,
-            .async_call,
-            .async_call_comma,
             => {
                 var buffer: [1]Ast.Node.Index = undefined;
                 const call = tree.fullCall(&buffer, node).?;
-                try p.renderOptTokenField(call.async_token, "async_token", .hide_if_none);
                 try p.renderField(call.ast.fn_expr, "fn_expr");
                 try p.renderNodeSliceField(call.ast.params, "params");
             },
@@ -449,7 +446,7 @@ const PrintAst = struct {
                 for (lbrace + 1..rbrace) |tok_i| {
                     const identifier_token: Ast.TokenIndex = @intCast(tok_i);
                     if (tree.tokenTag(identifier_token) != .identifier) continue;
-                    try p.w.print(".{},", .{std.zig.fmtId(tree.tokenSlice(identifier_token))});
+                    try p.w.print(".{f},", .{std.zig.fmtId(tree.tokenSlice(identifier_token))});
                 }
             },
             .container_decl,
@@ -492,15 +489,23 @@ const PrintAst = struct {
                     try p.renderItem(statement);
                 }
             },
-            .asm_simple,
-            .@"asm",
-            => {
-                const asm_data = tree.fullAsm(node).?;
+            .asm_legacy => {
+                const asm_data = tree.asmLegacy(node);
                 try p.renderOptTokenField(asm_data.first_clobber, "first_clobber", .hide_if_none);
                 try p.renderOptTokenField(asm_data.volatile_token, "volatile_token", .hide_if_none);
                 try p.renderField(asm_data.ast.template, "template");
                 try p.renderNodeSliceField(asm_data.inputs, "inputs");
                 try p.renderNodeSliceField(asm_data.outputs, "outputs");
+            },
+            .asm_simple,
+            .@"asm",
+            => {
+                const asm_data = tree.fullAsm(node).?;
+                try p.renderOptTokenField(asm_data.volatile_token, "volatile_token", .hide_if_none);
+                try p.renderField(asm_data.ast.template, "template");
+                try p.renderNodeSliceField(asm_data.inputs, "inputs");
+                try p.renderNodeSliceField(asm_data.outputs, "outputs");
+                try p.renderOptField(asm_data.ast.clobbers, "clobbers", .hide_if_none);
             },
             .asm_output => {
                 const name_token = tree.nodeMainToken(node);
@@ -530,7 +535,7 @@ const PrintAst = struct {
 
     fn newline(p: *PrintAst) !void {
         try p.w.writeByte('\n');
-        try p.w.writeByteNTimes(' ', p.indent * p.options.indent);
+        try p.w.splatByteAll(' ', p.indent * p.options.indent);
     }
 
     fn renderTrailing(p: *PrintAst, token: Ast.TokenIndex) !void {
@@ -603,7 +608,7 @@ const PrintAst = struct {
         if (opt_token) |token| {
             const tree = p.tree;
             try p.newline();
-            try p.w.print(".{s} = {},", .{ field_name, std.zig.fmtId(tree.tokenSlice(token)) });
+            try p.w.print(".{s} = {f},", .{ field_name, std.zig.fmtId(tree.tokenSlice(token)) });
             try p.renderTrailing(token);
         } else switch (style) {
             .always_render => {
@@ -699,12 +704,8 @@ fn nodeTagName(tag: Ast.Node.Tag) []const u8 {
         => "StructInit",
         .call_one,
         .call_one_comma,
-        .async_call_one,
-        .async_call_one_comma,
         .call,
         .call_comma,
-        .async_call,
-        .async_call_comma,
         => "Call",
         .@"switch",
         .switch_comma,
@@ -757,12 +758,12 @@ fn nodeTagName(tag: Ast.Node.Tag) []const u8 {
         .block,
         .block_semicolon,
         => "Block",
+        .asm_legacy,
         .asm_simple,
         .@"asm",
         => "Asm",
 
         .root => "Root",
-        .@"usingnamespace" => "Usingnamespace",
         .test_decl => "TestDecl",
         .@"errdefer" => "Errdefer",
         .@"defer" => "Defer",
@@ -823,7 +824,6 @@ fn nodeTagName(tag: Ast.Node.Tag) []const u8 {
         .negation_wrap => "NegationWrap",
         .address_of => "AddressOf",
         .@"try" => "Try",
-        .@"await" => "Await",
         .optional_type => "OptionalType",
         .deref => "Deref",
         .array_access => "ArrayAccess",
@@ -866,10 +866,10 @@ test PrintAst {
     var tree: Ast = try .parse(std.testing.allocator, source, .zig);
     defer tree.deinit(std.testing.allocator);
 
-    var output: std.ArrayListUnmanaged(u8) = .empty;
-    defer output.deinit(std.testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
 
-    try renderToWriter(tree, .{}, output.writer(std.testing.allocator));
+    renderToWriter(tree, .{}, &aw.writer) catch return error.OutOfMemory;
 
     try expectEqualStrings(
         \\pub const root = .{
@@ -913,11 +913,11 @@ test PrintAst {
         \\    }, // :2:5
         \\};
         \\
-    , output.items);
+    , aw.written());
 
     // The output itself is syntactically valid Zig code.
 
-    const printed_source = try output.toOwnedSliceSentinel(std.testing.allocator, 0);
+    const printed_source = try aw.toOwnedSliceSentinel(0);
     defer std.testing.allocator.free(printed_source);
 
     var printed_tree: Ast = try .parse(std.testing.allocator, printed_source, .zig);

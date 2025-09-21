@@ -1,18 +1,17 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zls = @import("zls");
 const test_options = @import("test_options");
 
 const allocator = std.testing.allocator;
 
 test "LSP lifecycle" {
-    var server = try zls.Server.create(allocator);
+    var server: *zls.Server = try .create(.{
+        .allocator = allocator,
+        .transport = null,
+        .config = null,
+    });
     defer server.destroy();
-
-    try server.updateConfiguration2(.{
-        .zig_exe_path = test_options.zig_exe_path,
-        .zig_lib_path = null,
-        .global_cache_path = test_options.global_cache_path,
-    }, .{});
 
     var arena_allocator: std.heap.ArenaAllocator = .init(allocator);
     defer arena_allocator.deinit();

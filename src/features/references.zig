@@ -17,7 +17,7 @@ fn labelReferences(
     decl: Analyser.DeclWithHandle,
     encoding: offsets.Encoding,
     include_decl: bool,
-) error{OutOfMemory}!std.ArrayListUnmanaged(types.Location) {
+) error{OutOfMemory}!std.ArrayList(types.Location) {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
@@ -30,7 +30,7 @@ fn labelReferences(
     const first_tok = decl.decl.label.identifier;
     const last_tok = ast.lastToken(tree, decl.decl.label.block);
 
-    var locations: std.ArrayListUnmanaged(types.Location) = .empty;
+    var locations: std.ArrayList(types.Location) = .empty;
     errdefer locations.deinit(allocator);
 
     if (include_decl) {
@@ -62,9 +62,11 @@ fn labelReferences(
 
 const Builder = struct {
     allocator: std.mem.Allocator,
-    locations: std.ArrayListUnmanaged(types.Location) = .empty,
+    locations: std.ArrayList(types.Location) = .empty,
     /// this is the declaration we are searching for
     decl_handle: Analyser.DeclWithHandle,
+    /// the decl is local to a function, block, etc
+    local_only_decl: bool,
     /// Whether the `decl_handle` has been added
     did_add_decl_handle: bool = false,
     analyser: *Analyser,
@@ -104,6 +106,10 @@ const Builder = struct {
     fn referenceNode(self: *const Context, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
         const builder = self.builder;
         const handle = self.handle;
+        const decl_name = offsets.identifierTokenToNameSlice(
+            builder.decl_handle.handle.tree,
+            builder.decl_handle.nameToken(),
+        );
 
         switch (tree.nodeTag(node)) {
             .identifier,
@@ -119,6 +125,7 @@ const Builder = struct {
                     else => unreachable,
                 };
                 const name = offsets.identifierTokenToNameSlice(tree, name_token);
+                if (!std.mem.eql(u8, name, decl_name)) return;
 
                 const child = try builder.analyser.lookupSymbolGlobal(
                     handle,
@@ -131,15 +138,18 @@ const Builder = struct {
                 }
             },
             .field_access => {
-                const lhs_node, const field_name = tree.nodeData(node).node_and_token;
+                if (builder.local_only_decl) return;
+                const lhs_node, const field_token = tree.nodeData(node).node_and_token;
+                const name = offsets.identifierTokenToNameSlice(tree, field_token);
+                if (!std.mem.eql(u8, name, decl_name)) return;
+
                 const lhs = try builder.analyser.resolveTypeOfNode(.of(lhs_node, handle)) orelse return;
                 const deref_lhs = try builder.analyser.resolveDerefType(lhs) orelse lhs;
 
-                const symbol = offsets.identifierTokenToNameSlice(tree, field_name);
-                const child = try deref_lhs.lookupSymbol(builder.analyser, symbol) orelse return;
+                const child = try deref_lhs.lookupSymbol(builder.analyser, name) orelse return;
 
                 if (builder.decl_handle.eql(child)) {
-                    try builder.add(handle, field_name);
+                    try builder.add(handle, field_token);
                 }
             },
             .struct_init_one,
@@ -151,23 +161,53 @@ const Builder = struct {
             .struct_init_dot_two,
             .struct_init_dot_two_comma,
             => {
+                if (builder.local_only_decl) return;
                 var buffer: [2]Ast.Node.Index = undefined;
                 const struct_init = tree.fullStructInit(&buffer, node).?;
                 for (struct_init.ast.fields) |value_node| { // the node of `value` in `.name = value`
                     const name_token = tree.firstToken(value_node) - 2; // math our way two token indexes back to get the `name`
-                    const name_loc = offsets.tokenToLoc(tree, name_token);
-                    const name = offsets.locToSlice(tree.source, name_loc);
+                    const name = offsets.identifierTokenToNameSlice(tree, name_token);
+                    if (!std.mem.eql(u8, name, decl_name)) continue;
 
-                    const lookup = try builder.analyser.lookupSymbolFieldInit(handle, name, node, &.{}) orelse continue;
+                    const nodes = switch (tree.nodeTag(node)) {
+                        .struct_init_dot,
+                        .struct_init_dot_comma,
+                        .struct_init_dot_two,
+                        .struct_init_dot_two_comma,
+                        => try ast.nodesOverlappingIndex(
+                            builder.allocator,
+                            tree,
+                            tree.tokenStart(name_token),
+                        ),
+                        // if this isn't an anonymous struct the type can be determined from the `T{}` directly
+                        .struct_init_one,
+                        .struct_init_one_comma,
+                        .struct_init,
+                        .struct_init_comma,
+                        => &.{node},
+                        else => unreachable,
+                    };
+
+                    const lookup = try builder.analyser.lookupSymbolFieldInit(
+                        handle,
+                        name,
+                        nodes[0],
+                        nodes[1..],
+                    ) orelse return;
 
                     if (builder.decl_handle.eql(lookup)) {
                         try builder.add(handle, name_token);
                     }
+                    // if we get here then we know that the name of the field matched
+                    // and duplicate fields are invalid so just return early
+                    return;
                 }
             },
             .enum_literal => {
+                if (builder.local_only_decl) return;
                 const name_token = tree.nodeMainToken(node);
                 const name = offsets.identifierTokenToNameSlice(handle.tree, name_token);
+                if (!std.mem.eql(u8, name, decl_name)) return;
                 const lookup = try builder.analyser.getSymbolEnumLiteral(handle, tree.tokenStart(name_token), name) orelse return;
 
                 if (builder.decl_handle.eql(lookup)) {
@@ -202,7 +242,7 @@ fn gatherReferences(
                 continue;
         }
 
-        var handle_dependencies: std.ArrayListUnmanaged([]const u8) = .empty;
+        var handle_dependencies: std.ArrayList([]const u8) = .empty;
         defer handle_dependencies.deinit(allocator);
         try analyser.store.collectDependencies(allocator, handle, &handle_dependencies);
 
@@ -236,56 +276,223 @@ fn symbolReferences(
     include_decl: bool,
     /// exclude references from the std library
     skip_std_references: bool,
-) error{OutOfMemory}!std.ArrayListUnmanaged(types.Location) {
+    curr_handle: *DocumentStore.Handle,
+) error{OutOfMemory}!std.ArrayList(types.Location) {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
     std.debug.assert(decl_handle.decl != .label); // use `labelReferences` instead
 
-    var builder = Builder{
-        .allocator = allocator,
-        .analyser = analyser,
-        .decl_handle = decl_handle,
-        .encoding = encoding,
-    };
-    errdefer builder.deinit();
+    const doc_scope = try decl_handle.handle.getDocumentScope();
+    const source_index = decl_handle.handle.tree.tokenStart(decl_handle.nameToken());
+    const scope_index = Analyser.innermostScopeAtIndexWithTag(doc_scope, source_index, .init(.{
+        .block = true,
+        .container = true,
+        .function = false,
+        .other = false,
+    })).unwrap().?;
+    const scope_node = doc_scope.getScopeAstNode(scope_index).?;
 
-    const curr_handle = decl_handle.handle;
-    if (include_decl) try builder.add(curr_handle, decl_handle.nameToken());
-
-    switch (decl_handle.decl) {
-        .ast_node => {
-            try builder.collectReferences(curr_handle, .root);
-
-            const source_index = decl_handle.handle.tree.tokenStart(decl_handle.nameToken());
-            // highlight requests only pertain to the current document, otherwise we can try to narrow things down
-            const workspace = if (request == .highlight) false else blk: {
-                const doc_scope = try curr_handle.getDocumentScope();
-                const scope_index = Analyser.innermostScopeAtIndex(doc_scope, source_index);
-                break :blk switch (doc_scope.getScopeTag(scope_index)) {
-                    .function, .block => false,
-                    .container, .container_usingnamespace => decl_handle.isPublic(),
-                    .other => true,
-                };
-            };
-            if (workspace) {
-                try gatherReferences(allocator, analyser, curr_handle, skip_std_references, include_decl, &builder, .get);
-            }
+    // If `local_node != null`, references to the declaration can only be
+    // found inside of the given ast node.
+    const local_node: ?Ast.Node.Index = switch (decl_handle.decl) {
+        .ast_node => switch (doc_scope.getScopeTag(scope_index)) {
+            .block => scope_node,
+            .container => null,
+            .function, .other => unreachable,
         },
         .optional_payload,
         .error_union_payload,
         .error_union_error,
         .for_loop_payload,
         .assign_destructure,
+        => scope_node,
         .switch_payload,
-        => {
-            try builder.collectReferences(curr_handle, .root);
-        },
-        .function_parameter => |payload| try builder.collectReferences(curr_handle, payload.func),
+        .switch_inline_tag_payload,
+        => |payload| payload.node,
+        .function_parameter => |payload| payload.func,
         .label => unreachable, // handled separately by labelReferences
-        .error_token => {},
+        .error_token => return .empty,
+    };
+
+    var builder: Builder = .{
+        .allocator = allocator,
+        .analyser = analyser,
+        .decl_handle = decl_handle,
+        .local_only_decl = local_node != null,
+        .encoding = encoding,
+    };
+    errdefer builder.deinit();
+
+    if (include_decl) try builder.add(decl_handle.handle, decl_handle.nameToken());
+
+    try builder.collectReferences(curr_handle, local_node orelse .root);
+
+    const workspace = local_node == null and request != .highlight and decl_handle.isPublic();
+    if (workspace) {
+        try gatherReferences(
+            allocator,
+            analyser,
+            curr_handle,
+            skip_std_references,
+            include_decl,
+            &builder,
+            .get,
+        );
     }
 
+    return builder.locations;
+}
+
+const ControlFlowBuilder = struct {
+    const Error = error{OutOfMemory};
+    locations: std.ArrayList(types.Location) = .empty,
+    encoding: offsets.Encoding,
+    token_handle: Analyser.TokenWithHandle,
+    allocator: std.mem.Allocator,
+    label: ?[]const u8 = null,
+    last_loop: Ast.TokenIndex,
+    nodes: []const Ast.Node.Index,
+    fn iter(builder: *ControlFlowBuilder, tree: Ast, node: Ast.Node.Index) Error!void {
+        const main_token = tree.nodeMainToken(node);
+        switch (tree.nodeTag(node)) {
+            .@"break", .@"continue" => {
+                if (tree.nodeData(node).opt_token_and_opt_node[0].unwrap()) |label_token| {
+                    const loop_or_switch_label = builder.label orelse return;
+                    const label = offsets.identifierTokenToNameSlice(tree, label_token);
+                    if (std.mem.eql(u8, loop_or_switch_label, label)) {
+                        try builder.add(main_token);
+                    }
+                } else for (builder.nodes) |n| switch (tree.nodeTag(n)) {
+                    .for_simple,
+                    .@"for",
+                    .while_cont,
+                    .while_simple,
+                    .@"while",
+                    => if (tree.nodeMainToken(n) == builder.last_loop)
+                        try builder.add(main_token),
+                    // break/continue on a switch must be labeled
+                    .@"switch",
+                    .switch_comma,
+                    => {},
+                    else => {},
+                };
+            },
+
+            .@"while",
+            .while_simple,
+            .while_cont,
+            .@"for",
+            .for_simple,
+            => {
+                const last_loop = builder.last_loop;
+                defer builder.last_loop = last_loop;
+                builder.last_loop = main_token;
+                try ast.iterateChildren(tree, node, builder, Error, iter);
+            },
+            else => try ast.iterateChildren(tree, node, builder, Error, iter),
+        }
+    }
+
+    fn add(builder: *ControlFlowBuilder, token_index: Ast.TokenIndex) Error!void {
+        const handle = builder.token_handle.handle;
+        try builder.locations.append(builder.allocator, .{
+            .uri = handle.uri,
+            .range = offsets.tokenToRange(handle.tree, token_index, builder.encoding),
+        });
+    }
+
+    fn deinit(builder: *ControlFlowBuilder) void {
+        builder.locations.deinit(builder.allocator);
+    }
+};
+
+fn controlFlowReferences(
+    allocator: std.mem.Allocator,
+    token_handle: Analyser.TokenWithHandle,
+    encoding: offsets.Encoding,
+    include_decl: bool,
+) error{OutOfMemory}!std.ArrayList(types.Location) {
+    const handle = token_handle.handle;
+    const tree = handle.tree;
+    const kw_token = token_handle.token;
+
+    const source_index = handle.tree.tokenStart(kw_token);
+    const nodes = try ast.nodesOverlappingIndex(allocator, tree, source_index);
+    defer allocator.free(nodes);
+
+    var builder: ControlFlowBuilder = .{
+        .allocator = allocator,
+        .token_handle = token_handle,
+        .encoding = encoding,
+        .last_loop = kw_token,
+        .nodes = nodes,
+    };
+    defer builder.deinit();
+
+    if (include_decl) {
+        try builder.add(kw_token);
+    }
+
+    switch (tree.tokenTag(kw_token)) {
+        .keyword_continue,
+        .keyword_break,
+        => {
+            const maybe_label = blk: {
+                if (kw_token + 2 >= tree.tokens.len) break :blk null;
+                if (tree.tokenTag(kw_token + 1) != .colon) break :blk null;
+                if (tree.tokenTag(kw_token + 2) != .identifier) break :blk null;
+                break :blk offsets.identifierTokenToNameSlice(tree, kw_token + 2);
+            };
+            for (nodes) |node| switch (tree.nodeTag(node)) {
+                .for_simple,
+                .@"for",
+                .while_cont,
+                .while_simple,
+                .@"while",
+                => {
+                    // if the break/continue is unlabeled it must belong to the first loop we encounter
+                    const main_token = tree.nodeMainToken(node);
+                    const label = maybe_label orelse break try builder.add(main_token);
+                    const loop_label = if (tree.isTokenPrecededByTags(main_token, &.{ .identifier, .colon }))
+                        offsets.identifierTokenToNameSlice(tree, main_token - 2)
+                    else
+                        continue;
+                    if (std.mem.eql(u8, label, loop_label)) {
+                        try builder.add(main_token);
+                    }
+                },
+                .switch_comma,
+                .@"switch",
+                => {
+                    const label = maybe_label orelse continue;
+                    const main_token = tree.nodeMainToken(node);
+                    const switch_label = if (tree.tokenTag(main_token) == .identifier)
+                        offsets.identifierTokenToNameSlice(tree, main_token)
+                    else
+                        continue;
+                    if (std.mem.eql(u8, label, switch_label)) {
+                        try builder.add(
+                            // we already know the switch is labeled so we can just offset
+                            main_token + 2,
+                        );
+                    }
+                },
+                else => {},
+            };
+        },
+        .keyword_for,
+        .keyword_while,
+        .keyword_switch,
+        => {
+            if (tree.isTokenPrecededByTags(kw_token, &.{ .identifier, .colon }))
+                builder.label = tree.tokenSlice(kw_token - 2);
+            try ast.iterateChildren(tree, nodes[0], &builder, ControlFlowBuilder.Error, ControlFlowBuilder.iter);
+        },
+        else => {},
+    }
+
+    defer builder.locations = .empty;
     return builder.locations;
 }
 
@@ -296,7 +503,7 @@ pub const Callsite = struct {
 
 const CallBuilder = struct {
     allocator: std.mem.Allocator,
-    callsites: std.ArrayListUnmanaged(Callsite) = .empty,
+    callsites: std.ArrayList(Callsite) = .empty,
     /// this is the declaration we are searching for
     decl_handle: Analyser.DeclWithHandle,
     analyser: *Analyser,
@@ -332,12 +539,8 @@ const CallBuilder = struct {
         switch (tree.nodeTag(node)) {
             .call,
             .call_comma,
-            .async_call,
-            .async_call_comma,
             .call_one,
             .call_one_comma,
-            .async_call_one,
-            .async_call_one_comma,
             => {
                 var buf: [1]Ast.Node.Index = undefined;
                 const call = tree.fullCall(&buf, node).?;
@@ -386,7 +589,7 @@ pub fn callsiteReferences(
     skip_std_references: bool,
     /// search other files for references
     workspace: bool,
-) error{OutOfMemory}!std.ArrayListUnmanaged(Callsite) {
+) error{OutOfMemory}!std.ArrayList(Callsite) {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
@@ -446,52 +649,66 @@ pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: Gen
     if (handle.tree.mode == .zon) return null;
 
     const source_index = offsets.positionToIndex(handle.tree.source, request.position(), server.offset_encoding);
-    const name_loc = Analyser.identifierLocFromIndex(handle.tree, source_index) orelse return null;
-    const name = offsets.locToSlice(handle.tree.source, name_loc);
     const pos_context = try Analyser.getPositionContext(server.allocator, handle.tree, source_index, true);
 
-    var analyser = server.initAnalyser(handle);
+    var analyser = server.initAnalyser(arena, handle);
     defer analyser.deinit();
-
-    // TODO: Make this work with branching types
-    const decl = switch (pos_context) {
-        .var_access => try analyser.lookupSymbolGlobal(handle, name, source_index),
-        .field_access => |loc| z: {
-            const held_loc = offsets.locMerge(loc, name_loc);
-            const a = try analyser.getSymbolFieldAccesses(arena, handle, source_index, held_loc, name);
-            if (a) |b| {
-                if (b.len != 0) break :z b[0];
-            }
-
-            break :z null;
-        },
-        .label_access, .label_decl => try Analyser.lookupLabel(handle, name, source_index),
-        .enum_literal => try analyser.getSymbolEnumLiteral(handle, source_index, name),
-        else => null,
-    } orelse return null;
 
     const include_decl = switch (request) {
         .references => |ref| ref.context.includeDeclaration,
         else => true,
     };
 
-    const locations = if (decl.decl == .label)
-        try labelReferences(arena, decl, server.offset_encoding, include_decl)
-    else
-        try symbolReferences(
-            arena,
-            &analyser,
-            request,
-            decl,
-            server.offset_encoding,
-            include_decl,
-            server.config.skip_std_references,
-        );
+    // TODO: Make this work with branching types
+    const locations = locs: {
+        if (pos_context == .keyword and request != .rename) {
+            break :locs try controlFlowReferences(
+                arena,
+                .{ .token = offsets.sourceIndexToTokenIndex(handle.tree, source_index).preferLeft(), .handle = handle },
+                server.offset_encoding,
+                include_decl,
+            );
+        }
+
+        const name_loc = Analyser.identifierLocFromIndex(handle.tree, source_index) orelse return null;
+        const name = offsets.locToSlice(handle.tree.source, name_loc);
+
+        const decl = switch (pos_context) {
+            .var_access => try analyser.lookupSymbolGlobal(handle, name, source_index),
+            .field_access => |loc| z: {
+                const held_loc = offsets.locMerge(loc, name_loc);
+                const a = try analyser.getSymbolFieldAccesses(arena, handle, source_index, held_loc, name);
+                if (a) |b| {
+                    if (b.len != 0) break :z b[0];
+                }
+
+                break :z null;
+            },
+            .label_access, .label_decl => try Analyser.lookupLabel(handle, name, source_index),
+            .enum_literal => try analyser.getSymbolEnumLiteral(handle, source_index, name),
+            .keyword => null,
+            else => null,
+        } orelse return null;
+
+        break :locs switch (decl.decl) {
+            .label => try labelReferences(arena, decl, server.offset_encoding, include_decl),
+            else => try symbolReferences(
+                arena,
+                &analyser,
+                request,
+                decl,
+                server.offset_encoding,
+                include_decl,
+                server.config_manager.config.skip_std_references,
+                handle,
+            ),
+        };
+    };
 
     switch (request) {
         .rename => |rename| {
-            const escaped_rename = try std.fmt.allocPrint(arena, "{}", .{std.zig.fmtId(rename.newName)});
-            var changes: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(types.TextEdit)) = .{};
+            const escaped_rename = try std.fmt.allocPrint(arena, "{f}", .{std.zig.fmtId(rename.newName)});
+            var changes: std.StringArrayHashMapUnmanaged(std.ArrayList(types.TextEdit)) = .{};
 
             for (locations.items) |loc| {
                 const gop = try changes.getOrPutValue(arena, loc.uri, .empty);
@@ -514,7 +731,7 @@ pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: Gen
         },
         .references => return .{ .references = locations.items },
         .highlight => {
-            var highlights: std.ArrayListUnmanaged(types.DocumentHighlight) = try .initCapacity(arena, locations.items.len);
+            var highlights: std.ArrayList(types.DocumentHighlight) = try .initCapacity(arena, locations.items.len);
             const uri = handle.uri;
             for (locations.items) |loc| {
                 if (!std.mem.eql(u8, loc.uri, uri)) continue;

@@ -3,10 +3,10 @@ const builtin = @import("builtin");
 
 /// Must match the `version` in `build.zig.zon`.
 /// Remove `.pre` when tagging a new ZLS release and add it back on the next development cycle.
-const zls_version: std.SemanticVersion = .{ .major = 0, .minor = 15, .patch = 0, .pre = "dev" };
+const zls_version: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 0, .pre = "dev" };
 
 /// Specify the minimum Zig version that is required to compile and test ZLS:
-/// std: eradicate u29 and embrace std.mem.Alignment
+/// std.Io: delete GenericReader, AnyReader, FixedBufferStream; and related API breakage
 ///
 /// If you do not use Nix, a ZLS maintainer can take care of this.
 /// Whenever this version is increased, run the following command:
@@ -15,17 +15,13 @@ const zls_version: std.SemanticVersion = .{ .major = 0, .minor = 15, .patch = 0,
 /// ```
 ///
 /// Also update the `minimum_zig_version` in `build.zig.zon`.
-const minimum_build_zig_version = "0.15.0-dev.346+f32a5d349";
+const minimum_build_zig_version = "0.16.0-dev.156+b7104231a";
 
-/// Specify the minimum Zig version that is required to run ZLS:
-/// Release 0.14.0
-///
-/// Examples of reasons that would cause the minimum runtime version to be bumped are:
-///   - breaking change to the Zig Syntax
-///   - breaking change to AstGen (i.e `zig ast-check`)
+/// Specify the minimum Zig version that is usable with ZLS:
+/// Release 0.15.1
 ///
 /// A breaking change to the Zig Build System should be handled by updating ZLS's build runner (see src\build_runner)
-const minimum_runtime_zig_version = "0.14.0";
+const minimum_runtime_zig_version = "0.15.1";
 
 const release_targets = [_]std.Target.Query{
     .{ .cpu_arch = .aarch64, .os_tag = .linux },
@@ -33,7 +29,6 @@ const release_targets = [_]std.Target.Query{
     .{ .cpu_arch = .aarch64, .os_tag = .windows },
     .{ .cpu_arch = .arm, .os_tag = .linux },
     .{ .cpu_arch = .loongarch64, .os_tag = .linux },
-    .{ .cpu_arch = .powerpc64le, .os_tag = .linux },
     .{ .cpu_arch = .riscv64, .os_tag = .linux },
     .{ .cpu_arch = .x86, .os_tag = .linux },
     .{ .cpu_arch = .x86, .os_tag = .windows },
@@ -43,6 +38,11 @@ const release_targets = [_]std.Target.Query{
     .{ .cpu_arch = .wasm32, .os_tag = .wasi },
 };
 
+const additional_tagged_release_targets = [_]std.Target.Query{
+    .{ .cpu_arch = .powerpc64le, .os_tag = .linux },
+    .{ .cpu_arch = .s390x, .os_tag = .linux },
+};
+
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -50,9 +50,6 @@ pub fn build(b: *Build) !void {
     const single_threaded = b.option(bool, "single-threaded", "Build a single threaded Executable");
     const pie = b.option(bool, "pie", "Build a Position Independent Executable");
     const strip = b.option(bool, "strip", "Strip executable");
-    const enable_tracy = b.option(bool, "enable-tracy", "Whether tracy should be enabled.") orelse false;
-    const enable_tracy_allocation = b.option(bool, "enable-tracy-allocation", "Enable using TracyAllocator to monitor allocations.") orelse enable_tracy;
-    const enable_tracy_callstack = b.option(bool, "enable-tracy-callstack", "Enable callstack graphs.") orelse enable_tracy;
     const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match filter") orelse &.{};
     const use_llvm = b.option(bool, "use-llvm", "Use Zig's llvm code backend");
     const coverage = b.option(bool, "coverage", "Generate a coverage report with kcov") orelse false;
@@ -64,7 +61,7 @@ pub fn build(b: *Build) !void {
         build_options.step.name = "ZLS build options";
 
         build_options.addOption(std.SemanticVersion, "version", resolved_zls_version);
-        build_options.addOption([]const u8, "version_string", b.fmt("{}", .{resolved_zls_version}));
+        build_options.addOption([]const u8, "version_string", b.fmt("{f}", .{resolved_zls_version}));
         build_options.addOption([]const u8, "minimum_runtime_zig_version_string", minimum_runtime_zig_version);
 
         break :blk build_options.createModule();
@@ -84,33 +81,26 @@ pub fn build(b: *Build) !void {
         test_options.step.name = "ZLS test options";
 
         test_options.addOptionPath("zig_exe_path", .{ .cwd_relative = b.graph.zig_exe });
-        // TODO these paths may be relative
-        test_options.addOptionPath("zig_lib_path", .{ .cwd_relative = b.fmt("{}", .{b.graph.zig_lib_directory}) });
+        test_options.addOptionPath("zig_lib_path", .{ .cwd_relative = b.fmt("{f}", .{b.graph.zig_lib_directory}) });
         test_options.addOptionPath("global_cache_path", .{ .cwd_relative = b.cache_root.join(b.allocator, &.{"zls"}) catch @panic("OOM") });
 
         break :blk test_options.createModule();
     };
+    const tracy_options, const tracy_enable = blk: {
+        const tracy_options = b.addOptions();
+        tracy_options.step.name = "tracy options";
 
-    const known_folders_module = b.dependency("known_folders", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("known-folders");
-    const diffz_module = b.dependency("diffz", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("diffz");
-    const lsp_module = b.dependency("lsp-codegen", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("lsp");
+        const enable = b.option(bool, "enable-tracy", "Whether tracy should be enabled.") orelse false;
+        const enable_allocation = b.option(bool, "enable-tracy-allocation", "Enable using TracyAllocator to monitor allocations.") orelse enable;
+        const enable_callstack = b.option(bool, "enable-tracy-callstack", "Enable callstack graphs.") orelse enable;
+        if (!enable) std.debug.assert(!enable_allocation and !enable_callstack);
 
-    const tracy_module = getTracyModule(b, .{
-        .target = target,
-        .optimize = optimize,
-        .enable = enable_tracy,
-        .enable_allocation = enable_tracy_allocation,
-        .enable_callstack = enable_tracy_callstack,
-    });
+        tracy_options.addOption(bool, "enable", enable);
+        tracy_options.addOption(bool, "enable_allocation", enable and enable_allocation);
+        tracy_options.addOption(bool, "enable_callstack", enable and enable_callstack);
+
+        break :blk .{ tracy_options.createModule(), enable };
+    };
 
     const gen_exe = b.addExecutable(.{
         .name = "zls_gen",
@@ -123,7 +113,7 @@ pub fn build(b: *Build) !void {
 
     const version_data_module = blk: {
         const gen_version_data_cmd = b.addRunArtifact(gen_exe);
-        const version = if (zls_version.pre == null and zls_version.build == null) b.fmt("{}", .{zls_version}) else "master";
+        const version = if (zls_version.pre == null and zls_version.build == null) b.fmt("{f}", .{zls_version}) else "master";
         gen_version_data_cmd.addArgs(&.{ "--langref-version", version });
 
         gen_version_data_cmd.addArg("--langref-path");
@@ -132,7 +122,7 @@ pub fn build(b: *Build) !void {
         gen_version_data_cmd.addArg("--generate-version-data");
         const version_data_path = gen_version_data_cmd.addOutputFileArg("version_data.zig");
 
-        break :blk b.addModule("version_data", .{ .root_source_file = version_data_path });
+        break :blk b.createModule(.{ .root_source_file = version_data_path });
     };
 
     { // zig build gen
@@ -152,50 +142,69 @@ pub fn build(b: *Build) !void {
         }
     }
 
-    const zls_module = b.addModule("zls", .{
-        .root_source_file = b.path("src/zls.zig"),
-        .target = target,
-        .optimize = optimize,
-        .single_threaded = single_threaded,
-        .pic = pie,
-        .imports = &.{
-            .{ .name = "known-folders", .module = known_folders_module },
-            .{ .name = "diffz", .module = diffz_module },
-            .{ .name = "lsp", .module = lsp_module },
-            .{ .name = "tracy", .module = tracy_module },
-            .{ .name = "build_options", .module = build_options },
-            .{ .name = "version_data", .module = version_data_module },
-        },
-    });
-
     { // zig build release
-        var release_artifacts: [release_targets.len]*Build.Step.Compile = undefined;
+        const is_tagged_release = zls_version.pre == null and zls_version.build == null;
+        const targets = comptime if (is_tagged_release) release_targets ++ additional_tagged_release_targets else release_targets;
 
-        for (release_targets, &release_artifacts) |target_query, *artifact| {
+        var release_artifacts: [targets.len]*Build.Step.Compile = undefined;
+        for (targets, &release_artifacts) |target_query, *artifact| {
+            const release_target = b.resolveTargetQuery(target_query);
+
+            const zls_release_module = createZLSModule(b, .{
+                .target = release_target,
+                .optimize = optimize,
+                .tracy_enable = tracy_enable,
+                .tracy_options = tracy_options,
+                .build_options = build_options,
+                .version_data = version_data_module,
+            });
+
+            const known_folders_module = b.dependency("known_folders", .{
+                .target = release_target,
+                .optimize = optimize,
+            }).module("known-folders");
+
+            const exe_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = release_target,
+                .optimize = optimize,
+                .single_threaded = single_threaded,
+                .pic = pie,
+                .strip = strip,
+                .imports = &.{
+                    .{ .name = "exe_options", .module = exe_options },
+                    .{ .name = "known-folders", .module = known_folders_module },
+                    .{ .name = "tracy", .module = zls_release_module.import_table.get("tracy").? },
+                    .{ .name = "zls", .module = zls_release_module },
+                },
+            });
+
             artifact.* = b.addExecutable(.{
                 .name = "zls",
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/main.zig"),
-                    .target = b.resolveTargetQuery(target_query),
-                    .optimize = optimize,
-                    .single_threaded = single_threaded,
-                    .pic = pie,
-                    .imports = &.{
-                        .{ .name = "exe_options", .module = exe_options },
-                        .{ .name = "known-folders", .module = known_folders_module },
-                        .{ .name = "tracy", .module = tracy_module },
-                        .{ .name = "zls", .module = zls_module },
-                    },
-                }),
-                .version = resolved_zls_version,
-                .max_rss = if (optimize == .Debug and target_query.os_tag == .wasi) 2_200_000_000 else 1_600_000_000,
+                .root_module = exe_module,
+                .max_rss = if (optimize == .Debug and target_query.os_tag == .wasi) 2_200_000_000 else 1_800_000_000,
                 .use_llvm = use_llvm,
                 .use_lld = use_llvm,
             });
         }
 
-        release(b, &release_artifacts);
+        release(b, &release_artifacts, resolved_zls_version);
     }
+
+    const zls_module = createZLSModule(b, .{
+        .target = target,
+        .optimize = optimize,
+        .tracy_enable = tracy_enable,
+        .tracy_options = tracy_options,
+        .build_options = build_options,
+        .version_data = version_data_module,
+    });
+    b.modules.put("zls", zls_module) catch @panic("OOM");
+
+    const known_folders_module = b.dependency("known_folders", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("known-folders");
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -207,13 +216,12 @@ pub fn build(b: *Build) !void {
         .imports = &.{
             .{ .name = "exe_options", .module = exe_options },
             .{ .name = "known-folders", .module = known_folders_module },
-            .{ .name = "tracy", .module = tracy_module },
+            .{ .name = "tracy", .module = zls_module.import_table.get("tracy").? },
             .{ .name = "zls", .module = zls_module },
         },
     });
 
     { // zig build
-
         const exe = b.addExecutable(.{
             .name = "zls",
             .root_module = exe_module,
@@ -258,31 +266,45 @@ pub fn build(b: *Build) !void {
         .use_lld = use_llvm,
     });
 
+    if (target.result.cpu.arch.isWasm() and b.enable_wasmtime) {
+        // Zig's build system integration with wasmtime does not support adding custom preopen directories so it is done manually.
+        const args: []const ?[]const u8 = &.{
+            "wasmtime",
+            "--dir=.",
+            b.fmt("--dir={f}::/lib", .{b.graph.zig_lib_directory}),
+            b.fmt("--dir={s}::/cache", .{b.cache_root.join(b.allocator, &.{"zls"}) catch @panic("OOM")}),
+            "--",
+            null,
+        };
+        tests.setExecCmd(args);
+        src_tests.setExecCmd(args);
+    }
+
     blk: { // zig build test, zig build test-build-runner, zig build test-analysis
         const test_step = b.step("test", "Run all the tests");
         const test_build_runner_step = b.step("test-build-runner", "Run all the build runner tests");
         const test_analysis_step = b.step("test-analysis", "Run all the analysis tests");
 
-        const latest_build_runner_version = std.meta.fieldNames(@import("src/build_runner/BuildRunnerVersion.zig").BuildRunnerVersion)[0];
-        const build_runner = b.path(b.fmt("src/build_runner/{s}.zig", .{latest_build_runner_version}));
-
         // Create run steps
-        @import("tests/add_build_runner_cases.zig").addCases(b, test_build_runner_step, test_filters, build_runner);
-        @import("tests/add_analysis_cases.zig").addCases(b, test_analysis_step, test_filters);
+        @import("tests/add_build_runner_cases.zig").addCases(b, test_build_runner_step, test_filters);
+        @import("tests/add_analysis_cases.zig").addCases(b, target, optimize, test_analysis_step, test_filters);
 
         const run_tests = b.addRunArtifact(tests);
         const run_src_tests = b.addRunArtifact(src_tests);
 
+        run_tests.skip_foreign_checks = target.result.cpu.arch.isWasm() and b.enable_wasmtime;
+        run_src_tests.skip_foreign_checks = target.result.cpu.arch.isWasm() and b.enable_wasmtime;
+
         // Setup dependencies of `zig build test`
         test_step.dependOn(&run_tests.step);
         test_step.dependOn(&run_src_tests.step);
-        test_step.dependOn(test_build_runner_step);
         test_step.dependOn(test_analysis_step);
+        if (target.query.eql(b.graph.host.query)) test_step.dependOn(test_build_runner_step);
 
         if (!coverage) break :blk;
 
         // Collect all run steps into one ArrayList
-        var run_test_steps: std.ArrayListUnmanaged(*std.Build.Step.Run) = .empty;
+        var run_test_steps: std.ArrayList(*std.Build.Step.Run) = .empty;
         run_test_steps.append(b.allocator, run_tests) catch @panic("OOM");
         run_test_steps.append(b.allocator, run_src_tests) catch @panic("OOM");
         for (test_build_runner_step.dependencies.items) |step| {
@@ -350,7 +372,7 @@ fn getVersion(b: *Build) std.SemanticVersion {
     switch (std.mem.count(u8, git_describe, "-")) {
         0 => {
             // Tagged release version (e.g. 0.10.0).
-            std.debug.assert(std.mem.eql(u8, git_describe, b.fmt("{}", .{zls_version}))); // tagged release must match version string
+            std.debug.assert(std.mem.eql(u8, git_describe, b.fmt("{f}", .{zls_version}))); // tagged release must match version string
             return zls_version;
         },
         2 => {
@@ -379,34 +401,74 @@ fn getVersion(b: *Build) std.SemanticVersion {
     }
 }
 
-fn getTracyModule(
+fn createZLSModule(
+    b: *Build,
+    options: struct {
+        target: Build.ResolvedTarget,
+        optimize: std.builtin.OptimizeMode,
+        tracy_enable: bool,
+        tracy_options: *std.Build.Module,
+        build_options: *std.Build.Module,
+        version_data: *std.Build.Module,
+    },
+) *std.Build.Module {
+    const diffz_module = b.dependency("diffz", .{
+        .target = options.target,
+        .optimize = options.optimize,
+    }).module("diffz");
+    const lsp_module = b.dependency("lsp_kit", .{
+        .target = options.target,
+        .optimize = options.optimize,
+    }).module("lsp");
+    const tracy_module = createTracyModule(b, .{
+        .target = options.target,
+        .optimize = options.optimize,
+        .enable = options.tracy_enable,
+        .tracy_options = options.tracy_options,
+    });
+
+    const zls_module = b.createModule(.{
+        .root_source_file = b.path("src/zls.zig"),
+        .target = options.target,
+        .optimize = options.optimize,
+        .imports = &.{
+            .{ .name = "diffz", .module = diffz_module },
+            .{ .name = "lsp", .module = lsp_module },
+            .{ .name = "tracy", .module = tracy_module },
+            .{ .name = "build_options", .module = options.build_options },
+            .{ .name = "version_data", .module = options.version_data },
+        },
+    });
+
+    if (options.target.result.os.tag == .windows) {
+        zls_module.linkSystemLibrary("advapi32", .{});
+    }
+
+    return zls_module;
+}
+
+fn createTracyModule(
     b: *Build,
     options: struct {
         target: Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
         enable: bool,
-        enable_allocation: bool,
-        enable_callstack: bool,
+        tracy_options: *std.Build.Module,
     },
 ) *Build.Module {
-    const tracy_options = b.addOptions();
-    tracy_options.step.name = "tracy options";
-    tracy_options.addOption(bool, "enable", options.enable);
-    tracy_options.addOption(bool, "enable_allocation", options.enable and options.enable_allocation);
-    tracy_options.addOption(bool, "enable_callstack", options.enable and options.enable_callstack);
-
-    const tracy_module = b.addModule("tracy", .{
+    const tracy_module = b.createModule(.{
         .root_source_file = b.path("src/tracy.zig"),
         .target = options.target,
         .optimize = options.optimize,
         .imports = &.{
-            .{ .name = "options", .module = tracy_options.createModule() },
+            .{ .name = "options", .module = options.tracy_options },
         },
         .link_libc = options.enable,
         .link_libcpp = options.enable,
-        .sanitize_c = false,
+        .sanitize_c = .off,
     });
     if (!options.enable) return tracy_module;
+
     const tracy_dependency = b.lazyDependency("tracy", .{
         .target = options.target,
         .optimize = options.optimize,
@@ -426,64 +488,26 @@ fn getTracyModule(
     return tracy_module;
 }
 
-/// - compile ZLS binaries with different targets
+/// - compile amdZLS binaries with different targets
 /// - compress them (.tar.xz or .zip)
 /// - optionally sign them with minisign (https://github.com/jedisct1/minisign)
-/// - send a http `multipart/form-data` request to a Cloudflare worker at https://github.com/zigtools/release-worker
-fn release(b: *Build, release_artifacts: []const *Build.Step.Compile) void {
+/// - install artifacts and a `release.json` metadata file to `./zig-out`
+fn release(b: *Build, release_artifacts: []const *Build.Step.Compile, released_zls_version: std.SemanticVersion) void {
     std.debug.assert(release_artifacts.len > 0);
-    for (release_artifacts) |compile| std.debug.assert(compile.version != null);
 
-    const publish_step = b.step("publish", "Publish release artifacts to releases.zigtools.org");
     const release_step = b.step("release", "Build all release artifacts. (requires tar and 7z)");
     const release_minisign = b.option(bool, "release-minisign", "Sign release artifacts with Minisign") orelse false;
+
+    if (released_zls_version.pre != null and released_zls_version.build == null) {
+        release_step.addError("Cannot build release because the ZLS version could not be resolved", .{}) catch @panic("OOM");
+        return;
+    }
 
     const FileExtension = enum {
         zip,
         @"tar.xz",
         @"tar.gz",
     };
-
-    const uri: std.Uri = if (b.graph.env_map.get("ZLS_WORKER_ENDPOINT")) |endpoint| blk: {
-        var uri = std.Uri.parse(endpoint) catch std.debug.panic("invalid URI: '{s}'", .{endpoint});
-        if (!uri.path.isEmpty()) std.debug.panic("ZLS_WORKER_ENDPOINT URI must have no path component: '{s}'", .{endpoint});
-        uri.path = .{ .raw = "/v1/zls/publish" };
-        break :blk uri;
-    } else .{
-        .scheme = "https",
-        .host = .{ .raw = "releases.zigtools.org" },
-        .path = .{ .raw = "/v1/zls/publish" },
-    };
-
-    const password = b.graph.env_map.get("ZLS_WORKER_API_TOKEN") orelse "amogus";
-
-    const publish_exe = b.addExecutable(.{
-        .name = "publish",
-        .target = b.graph.host,
-        .root_source_file = b.path("src/tools/publish_http_form.zig"),
-    });
-
-    // var publish_artifacts = b.addSystemCommand("curl")
-    var publish_artifacts = b.addRunArtifact(publish_exe);
-    publish_step.dependOn(&publish_artifacts.step);
-
-    publish_artifacts.addArgs(&.{
-        b.fmt("{}", .{uri}),
-        "--user",
-        b.fmt("admin:{s}", .{password}),
-    });
-    // It is possible for the version to be something like `0.12.0-dev` when `git describe` failed.
-    // Ideally we would want to report a failure about this when running one of the release/publish steps.
-    // The problem is during the configure phase, it is not possible to know which top level steps gets run.
-    // So instead we use rely on the release-worker to reject this version string during the make phase.
-    // One possible alternative would be to use a configuration option (i.e. -Dpublish) to conditionally run an assertion.
-    publish_artifacts.addArgs(&.{
-        "--form", b.fmt("zls-version={}", .{release_artifacts[0].version.?}),
-        "--form", "compatibility=full",
-        "--form", b.fmt("zig-version={s}", .{builtin.zig_version_string}),
-        "--form", b.fmt("minimum-build-zig-version={s}", .{minimum_build_zig_version}),
-        "--form", b.fmt("minimum-runtime-zig-version={s}", .{minimum_runtime_zig_version}),
-    });
 
     var compressed_artifacts: std.StringArrayHashMapUnmanaged(std.Build.LazyPath) = .empty;
 
@@ -495,21 +519,18 @@ fn release(b: *Build, release_artifacts: []const *Build.Step.Compile) void {
         const extensions: []const FileExtension = if (is_windows) &.{.zip} else &.{ .@"tar.xz", .@"tar.gz" };
 
         for (extensions) |extension| {
-            const cpu_arch_name = switch (resolved_target.cpu.arch) {
-                .arm => "armv7a", // To match the https://ziglang.org/download/ tarballs
-                else => |arch| @tagName(arch),
-            };
-            const file_name = b.fmt("zls-{s}-{s}-{}.{s}", .{
-                @tagName(resolved_target.os.tag),
-                cpu_arch_name,
-                exe.version.?,
-                @tagName(extension),
+            const file_name = b.fmt("zls-{t}-{t}-{f}.{t}", .{
+                resolved_target.cpu.arch,
+                resolved_target.os.tag,
+                released_zls_version,
+                extension,
             });
 
             const compress_cmd = std.Build.Step.Run.create(b, "compress artifact");
+            compress_cmd.clearEnvironment();
             compress_cmd.step.max_rss = switch (extension) {
                 .zip => 160 * 1024 * 1024, // 160 MiB
-                .@"tar.xz" => 512 * 1024 * 1024, // 512 MiB
+                .@"tar.xz" => 768 * 1024 * 1024, // 512 MiB
                 .@"tar.gz" => 16 * 1024 * 1024, // 12 MiB
             };
             switch (extension) {
@@ -551,24 +572,41 @@ fn release(b: *Build, release_artifacts: []const *Build.Step.Compile) void {
 
         const install_tarball = b.addInstallFileWithDir(file_path, install_dir, file_name);
         release_step.dependOn(&install_tarball.step);
-        publish_artifacts.addArg("--form");
-        publish_artifacts.addPrefixedFileArg(b.fmt("{s}=@", .{file_name}), file_path);
 
         if (release_minisign) {
             const minisign_basename = b.fmt("{s}.minisig", .{file_name});
 
             const minising_cmd = b.addSystemCommand(&.{ "minisign", "-Sm" });
+            minising_cmd.clearEnvironment();
             minising_cmd.addFileArg(file_path);
             minising_cmd.addPrefixedFileArg("-s", .{ .cwd_relative = "minisign.key" });
             const minising_file_path = minising_cmd.addPrefixedOutputFileArg("-x", minisign_basename);
 
             const install_minising = b.addInstallFileWithDir(minising_file_path, install_dir, minisign_basename);
             release_step.dependOn(&install_minising.step);
-
-            publish_artifacts.addArg("--form");
-            publish_artifacts.addPrefixedFileArg(b.fmt("{s}=@", .{minisign_basename}), minising_file_path);
         }
     }
+
+    const source = b.fmt(
+        \\{{
+        \\  "zlsVersion": "{[zls_version]f}",
+        \\  "zigVersion": "{[zig_version]f}",
+        \\  "minimumBuildZigVersion": "{[minimum_build_zig_version]s}",
+        \\  "minimumRuntimeZigVersion": "{[minimum_runtime_zig_version]s}",
+        \\  "files": {[files]f}
+        \\}}
+        \\
+    , .{
+        .zls_version = released_zls_version,
+        .zig_version = builtin.zig_version,
+        .minimum_build_zig_version = minimum_build_zig_version,
+        .minimum_runtime_zig_version = minimum_runtime_zig_version,
+        .files = std.json.fmt(compressed_artifacts.keys(), .{}),
+    });
+
+    const write_files = b.addWriteFiles();
+    const install_metadata = b.addInstallFile(write_files.add("release.json", source), "release.json");
+    release_step.dependOn(&install_metadata.step);
 }
 
 const Build = blk: {
@@ -577,59 +615,66 @@ const Build = blk: {
     const min_build_zig = std.SemanticVersion.parse(minimum_build_zig_version) catch unreachable;
     const min_runtime_zig = std.SemanticVersion.parse(minimum_runtime_zig_version) catch unreachable;
 
+    const min_build_zig_is_tagged = min_build_zig.build == null and min_build_zig.pre == null;
+    const min_runtime_is_tagged = min_build_zig.build == null and min_build_zig.pre == null;
+
+    const min_build_zig_simple: std.SemanticVersion = .{ .major = min_build_zig.major, .minor = min_build_zig.minor, .patch = 0 };
+    const min_runtime_zig_simple: std.SemanticVersion = .{ .major = min_runtime_zig.major, .minor = min_runtime_zig.minor, .patch = 0 };
+
     std.debug.assert(zls_version.pre == null or std.mem.eql(u8, zls_version.pre.?, "dev"));
     std.debug.assert(zls_version.build == null);
     const zls_version_is_tagged = zls_version.pre == null and zls_version.build == null;
     const zls_version_simple: std.SemanticVersion = .{ .major = zls_version.major, .minor = zls_version.minor, .patch = 0 };
+    const zls_version_simple_str = std.fmt.comptimePrint("{d}.{d}.0", .{ zls_version.major, zls_version.minor });
 
     if (min_runtime_zig.order(min_build_zig) == .gt) {
         const message = std.fmt.comptimePrint(
             \\A Zig version that is able to build ZLS must be compatible with ZLS at runtime.
             \\
             \\This means that the minimum runtime Zig version must be less or equal to the minimum build Zig version:
-            \\  minimum build   Zig version: {[min_build_zig]}
-            \\  minimum runtime Zig version: {[min_runtime_zig]}
+            \\  minimum build   Zig version: {[min_build_zig]s}
+            \\  minimum runtime Zig version: {[min_runtime_zig]s}
             \\
             \\This is a developer error.
-        , .{ .min_build_zig = min_build_zig, .min_runtime_zig = min_runtime_zig });
+        , .{ .min_build_zig = minimum_build_zig_version, .min_runtime_zig = minimum_runtime_zig_version });
         @compileError(message);
     }
 
     // check that the ZLS version and minimum build version make sense
     if (zls_version_is_tagged) {
-        if (zls_version_simple.order(min_build_zig) != .eq) {
+        // A different patch version is allowed (e.g ZLS 0.15.0 can require Zig 0.15.1)
+
+        if (!min_build_zig_is_tagged or zls_version_simple.order(min_build_zig_simple) != .eq) {
             const message = std.fmt.comptimePrint(
                 \\A tagged release of ZLS should have the same tagged release of Zig as the minimum build requirement:
-                \\          ZLS version: {[current_version]}
-                \\  minimum Zig version: {[minimum_version]}
+                \\          ZLS version: {[current_version]s}
+                \\  minimum Zig version: {[minimum_version]s}
                 \\
-                \\This is a developer error. Set `minimum_build_zig_version` in `build.zig` and `minimum_zig_version` in `build.zig.zon` to {[current_version]}.
-            , .{ .current_version = zls_version_simple, .minimum_version = min_build_zig });
+                \\This is a developer error. Set `minimum_build_zig_version` in `build.zig` and `minimum_zig_version` in `build.zig.zon` to {[current_version]s}.
+            , .{ .current_version = zls_version_simple_str, .minimum_version = minimum_build_zig_version });
             @compileError(message);
         }
-        if (zls_version_simple.order(min_runtime_zig) != .eq) {
+        if (!min_runtime_is_tagged or zls_version_simple.order(min_runtime_zig_simple) != .eq) {
             const message = std.fmt.comptimePrint(
                 \\A tagged release of ZLS should have the same tagged release of Zig as the minimum runtime version:
-                \\          ZLS version: {[current_version]}
-                \\  minimum Zig version: {[minimum_version]}
+                \\          ZLS version: {[current_version]s}
+                \\  minimum Zig version: {[minimum_version]s}
                 \\
-                \\This is a developer error. Set `minimum_runtime_zig_version` in `build.zig` to `{[current_version]}`.
-            , .{ .current_version = zls_version_simple, .minimum_version = min_runtime_zig });
+                \\This is a developer error. Set `minimum_runtime_zig_version` in `build.zig` to `{[current_version]s}`.
+            , .{ .current_version = zls_version_simple_str, .minimum_version = minimum_runtime_zig_version });
             @compileError(message);
         }
     } else {
-        const min_build_zig_simple: std.SemanticVersion = .{ .major = min_build_zig.major, .minor = min_build_zig.minor, .patch = 0 };
-        const min_zig_is_tagged = min_build_zig.build == null and min_build_zig.pre == null;
-        if (!min_zig_is_tagged and zls_version_simple.order(min_build_zig_simple) != .eq) {
+        if (!min_build_zig_is_tagged and zls_version_simple.order(min_build_zig_simple) != .eq) {
             const message = std.fmt.comptimePrint(
                 \\A development build of ZLS should have a tagged release of Zig as the minimum build requirement or
                 \\have a development build of Zig as the minimum build requirement with the same major and minor version.
                 \\          ZLS version: {d}.{d}.*
-                \\  minimum Zig version: {}
+                \\  minimum Zig version: {s}
                 \\
                 \\
                 \\This is a developer error.
-            , .{ zls_version.major, zls_version.minor, min_build_zig });
+            , .{ zls_version.major, zls_version.minor, minimum_build_zig_version });
             @compileError(message);
         }
     }
@@ -637,7 +682,6 @@ const Build = blk: {
     // check minimum build version
     const is_current_zig_tagged_release = builtin.zig_version.pre == null and builtin.zig_version.build == null;
     const is_min_build_zig_tagged_release = min_build_zig.pre == null and min_build_zig.build == null;
-    const min_build_zig_simple: std.SemanticVersion = .{ .major = min_build_zig.major, .minor = min_build_zig.minor, .patch = 0 };
     const current_zig_simple: std.SemanticVersion = .{ .major = builtin.zig_version.major, .minor = builtin.zig_version.minor, .patch = 0 };
     if (switch (builtin.zig_version.order(min_build_zig)) {
         .lt => true,
@@ -648,32 +692,32 @@ const Build = blk: {
     }) {
         const message = std.fmt.comptimePrint(
             \\Your Zig version does not meet the minimum build requirement:
-            \\  required Zig version: {[minimum_version]} {[required_zig_version_note]s}
-            \\  actual   Zig version: {[current_version]}
+            \\  required Zig version: {[minimum_version]s} {[required_zig_version_note]s}
+            \\  actual   Zig version: {[current_version]s}
             \\
             \\
         ++ if (is_min_build_zig_tagged_release)
             std.fmt.comptimePrint(
-                \\Please download the {[minimum_version]} release of Zig. (https://ziglang.org/download/)
+                \\Please download the {[minimum_version]s} release of Zig. (https://ziglang.org/download/)
                 \\
                 \\Tagged releases of ZLS are also available.
                 \\  -> https://github.com/zigtools/zls/releases
                 \\  -> https://github.com/zigtools/zls/releases/tag/{[minimum_version_simple]} (may not exist yet)
             , .{
-                .minimum_version = min_build_zig,
+                .minimum_version = minimum_build_zig_version,
                 .minimum_version_simple = min_build_zig_simple,
             })
         else if (is_current_zig_tagged_release)
             \\Please download or compile a tagged release of ZLS.
             \\  -> https://github.com/zigtools/zls/releases
-            \\  -> https://github.com/zigtools/zls/releases/tag/{[current_version]} (may not exist yet)
+            \\  -> https://github.com/zigtools/zls/releases/tag/{[current_version]s} (may not exist yet)
         else
             \\You can take one of the following actions to resolve this issue:
             \\  - Download the latest nightly of Zig (https://ziglang.org/download/)
             \\  - Compile an older version of ZLS that is compatible with your Zig version
         , .{
-            .current_version = builtin.zig_version,
-            .minimum_version = min_build_zig,
+            .current_version = builtin.zig_version_string,
+            .minimum_version = minimum_build_zig_version,
             .required_zig_version_note = if (!zls_version_is_tagged) "(or greater)" else "",
         });
         @compileError(message);

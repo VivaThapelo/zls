@@ -5,7 +5,7 @@ const helper = @import("../helper.zig");
 const Context = @import("../context.zig").Context;
 const ErrorBuilder = @import("../ErrorBuilder.zig");
 
-const types = zls.types;
+const types = zls.lsp.types;
 const offsets = zls.offsets;
 
 const allocator: std.mem.Allocator = std.testing.allocator;
@@ -243,11 +243,11 @@ test "var decl" {
         \\const foo<@TypeOf(undefined)> = undefined;
     , .{ .kind = .Type });
     try testInlayHints(
-        \\const foo<**const [3:0]u8> = &"Bar";
+        \\const foo<*const *const [3:0]u8> = &"Bar";
     , .{ .kind = .Type });
     try testInlayHints(
         \\const foo: *[]const u8 = &"Bar";
-        \\const baz<**[]const u8> = &foo;
+        \\const baz<*const *[]const u8> = &foo;
     , .{ .kind = .Type });
     try testInlayHints(
         \\const Foo<type> = struct { bar: u32 };
@@ -256,7 +256,7 @@ test "var decl" {
         \\    const baz: ?Foo = Foo{ .bar<u32> = 42 };
         \\    if (baz) |b<Foo>| {
         \\        const d: Error!?Foo = b;
-        \\        const e<*error{e}!?Foo> = &d;
+        \\        const e<*const error{e}!?Foo> = &d;
         \\        const f<Foo> = (try e.*).?;
         \\        _ = f;
         \\    }
@@ -288,18 +288,24 @@ test "var decl" {
 
 test "comptime return types" {
     try testInlayHints(
-        \\const std<type> = @import("std");
-        \\const list<ArrayListAligned(ArrayListAligned(i32))> = std.ArrayList(std.ArrayList(i32)).init(allocator);
-        \\const innerList<ArrayListAligned(i32)> = list.items[0];
-        \\const nested<i32> = list.items[0].items[0];
+        \\fn Box(comptime T: type) type {
+        \\    return struct {
+        \\        value: T,
+        \\    };
+        \\}
+        \\const list: Box(Box(i32)) = undefined;
+        \\const innerList: Box(i32) = list.value;
+        \\const nested: i32 = list.value.value;
     , .{ .kind = .Type });
 
     try testInlayHints(
-        \\const std<type> = @import("std");
-        \\const str<[]u8> = try std.mem.concat(allocator, u8, .{ "foo", "bar" });
-        \\const int<[]i32> = try std.mem.concat(allocator, i32, .{ .{ 1, 2, 3 }, .{ 4, 5, 6 } });
+        \\fn concat(comptime T: type, slices: []const []const T) error{OutOfMemory}![]T {}
+        \\const str<[]u8> = try concat(u8, .{ "foo", "bar" });
+        \\const int<[]i32> = try concat(i32, .{ .{ 1, 2, 3 }, .{ 4, 5, 6 } });
     , .{ .kind = .Type });
+}
 
+test "comptime return types - HashMap" {
     try testInlayHints(
         \\const std<type> = @import("std");
         \\const boolMap<HashMap(i32,bool,AutoContext(i32))> = std.AutoHashMap(i32, bool).init(allocator);
@@ -346,7 +352,7 @@ test "function alias" {
         \\fn foo(alpha: u32) void {
         \\    return alpha;
         \\}
-        \\const bar<fn (alpha: u32) void> = foo;
+        \\const bar<fn (u32) void> = foo;
     , .{ .kind = .Type });
     try testInlayHints(
         \\pub fn foo(
@@ -355,7 +361,7 @@ test "function alias" {
         \\) u32 {
         \\    return alpha;
         \\}
-        \\const bar<*fn (comptime alpha: u32) u32> = &foo;
+        \\const bar<*const fn (comptime u32) u32> = &foo;
     , .{ .kind = .Type });
 }
 
@@ -403,10 +409,9 @@ test "function with error union" {
 }
 
 test "generic function parameter" {
-    // TODO there should be an inlay hint that shows `T`
     try testInlayHints(
         \\fn foo(comptime T: type, param: T) void {
-        \\    const val = param;
+        \\    const val: T = param;
         \\}
     , .{ .kind = .Type });
 }
@@ -478,7 +483,7 @@ test "capture values with while loop" {
         \\  Err1,
         \\};
         \\const Iterator<type> = struct {
-        \\    pub fn next(self: *Foo) Error!?usize {}
+        \\    pub fn next(self: *Iterator) Error!?usize {}
         \\};
         \\test {
         \\    var it: Iterator = .{};
@@ -594,12 +599,12 @@ fn testInlayHints(source: []const u8, options: Options) !void {
     var ctx: Context = try .init();
     defer ctx.deinit();
 
-    ctx.server.config.inlay_hints_show_parameter_name = options.kind == .Parameter;
-    ctx.server.config.inlay_hints_show_variable_type_hints = options.kind == .Type;
-    ctx.server.config.inlay_hints_show_builtin = options.show_builtin;
-    ctx.server.config.inlay_hints_exclude_single_argument = options.exclude_single_argument;
-    ctx.server.config.inlay_hints_hide_redundant_param_names = options.hide_redundant_param_names;
-    ctx.server.config.inlay_hints_hide_redundant_param_names_last_token = options.hide_redundant_param_names_last_token;
+    ctx.server.config_manager.config.inlay_hints_show_parameter_name = options.kind == .Parameter;
+    ctx.server.config_manager.config.inlay_hints_show_variable_type_hints = options.kind == .Type;
+    ctx.server.config_manager.config.inlay_hints_show_builtin = options.show_builtin;
+    ctx.server.config_manager.config.inlay_hints_exclude_single_argument = options.exclude_single_argument;
+    ctx.server.config_manager.config.inlay_hints_hide_redundant_param_names = options.hide_redundant_param_names;
+    ctx.server.config_manager.config.inlay_hints_hide_redundant_param_names_last_token = options.hide_redundant_param_names_last_token;
 
     const test_uri = try ctx.addDocument(.{ .source = phr.new_source });
 

@@ -12,7 +12,7 @@ scopes: std.MultiArrayList(Scope),
 declarations: std.MultiArrayList(Declaration),
 /// used for looking up a child declaration in a given scope
 declaration_lookup_map: DeclarationLookupMap,
-extra: std.ArrayListUnmanaged(u32),
+extra: std.ArrayList(u32),
 /// All identifier token that are in error sets.
 /// When there are multiple error sets that contain the same error, only one of them is stored.
 /// A token that has a doc comment takes priority.
@@ -77,70 +77,13 @@ pub const DeclarationLookupContext = struct {
     }
 };
 
-/// Assumes that the `node` is not a container_field of a struct tuple field.
-/// Returns a `.identifier` or `.builtin` token.
-fn getDeclNameToken(tree: Ast, node: Ast.Node.Index) ?Ast.TokenIndex {
-    var buffer: [1]Ast.Node.Index = undefined;
-    const token_index = switch (tree.nodeTag(node)) {
-        .local_var_decl,
-        .global_var_decl,
-        .simple_var_decl,
-        .aligned_var_decl,
-        => tree.nodeMainToken(node) + 1,
-        .fn_proto,
-        .fn_proto_multi,
-        .fn_proto_one,
-        .fn_proto_simple,
-        .fn_decl,
-        => tree.fullFnProto(&buffer, node).?.name_token orelse return null,
-
-        .identifier => tree.nodeMainToken(node),
-        .test_decl => tree.nodeData(node).opt_token_and_node[0].unwrap() orelse return null,
-
-        .container_field,
-        .container_field_init,
-        .container_field_align,
-        => tree.nodeMainToken(node),
-
-        .root,
-        .container_decl,
-        .container_decl_trailing,
-        .container_decl_arg,
-        .container_decl_arg_trailing,
-        .container_decl_two,
-        .container_decl_two_trailing,
-        .tagged_union,
-        .tagged_union_trailing,
-        .tagged_union_two,
-        .tagged_union_two_trailing,
-        .tagged_union_enum_tag,
-        .tagged_union_enum_tag_trailing,
-        .block,
-        .block_semicolon,
-        .block_two,
-        .block_two_semicolon,
-        => return null,
-
-        else => unreachable,
-    };
-
-    return switch (tree.tokenTag(token_index)) {
-        .identifier, .builtin => token_index,
-        else => null,
-    };
-}
-
 pub const Declaration = union(enum) {
     /// Index of the ast node.
     /// Can have one of the following tags:
-    ///   - `.root`
-    ///   - `.container_decl`
-    ///   - `.tagged_union`
     ///   - `.container_field`
     ///   - `.fn_proto`
     ///   - `.fn_decl`
     ///   - `.var_decl`
-    ///   - `.block`
     ast_node: Ast.Node.Index,
     /// Function parameter
     function_parameter: Param,
@@ -171,8 +114,11 @@ pub const Declaration = union(enum) {
         condition: Ast.Node.OptionalIndex,
     },
     assign_destructure: AssignDestructure,
-    // a switch case capture
+    /// - `switch (condition) { .case => |value| {} }`
     switch_payload: Switch,
+    /// - `switch (condition) { inline .case => |_, tag| {} }`
+    /// - `switch (condition) { inline else => |_, tag| {} }`
+    switch_inline_tag_payload: Switch,
     label: struct {
         identifier: Ast.TokenIndex,
         block: Ast.Node.Index,
@@ -180,6 +126,12 @@ pub const Declaration = union(enum) {
     /// always an identifier
     /// used as child declarations of an error set declaration
     error_token: Ast.TokenIndex,
+
+    comptime {
+        for (std.meta.fields(Declaration)) |field| {
+            std.debug.assert(@sizeOf(field.type) <= 8); // a Declaration without the union tag must be less than 8 bytes
+        }
+    }
 
     pub const Param = struct {
         param_index: u16,
@@ -250,7 +202,34 @@ pub const Declaration = union(enum) {
     /// Returns a `.identifier` or `.builtin` token.
     pub fn nameToken(decl: Declaration, tree: Ast) Ast.TokenIndex {
         return switch (decl) {
-            .ast_node => |n| getDeclNameToken(tree, n).?,
+            .ast_node => |node| {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const token_index = switch (tree.nodeTag(node)) {
+                    .local_var_decl,
+                    .global_var_decl,
+                    .simple_var_decl,
+                    .aligned_var_decl,
+                    => tree.nodeMainToken(node) + 1,
+                    .fn_proto,
+                    .fn_proto_multi,
+                    .fn_proto_one,
+                    .fn_proto_simple,
+                    .fn_decl,
+                    => tree.fullFnProto(&buffer, node).?.name_token.?,
+
+                    .container_field,
+                    .container_field_init,
+                    .container_field_align,
+                    => tree.nodeMainToken(node),
+
+                    else => unreachable,
+                };
+
+                switch (tree.tokenTag(token_index)) {
+                    .identifier, .builtin => return token_index,
+                    else => unreachable,
+                }
+            },
             .function_parameter => |payload| payload.get(tree).?.name_token.?,
             .optional_payload => |payload| payload.identifier,
             .error_union_payload => |payload| payload.identifier,
@@ -263,10 +242,12 @@ pub const Declaration = union(enum) {
                 const varDecl = tree.fullVarDecl(var_decl_node).?;
                 return varDecl.ast.mut_token + 1;
             },
-            .switch_payload => |payload| {
+            .switch_payload,
+            .switch_inline_tag_payload,
+            => |payload| {
                 const case = payload.getCase(tree);
                 const payload_token = case.payload_token.?;
-                return payload_token + @intFromBool(tree.tokenTag(payload_token) == .asterisk);
+                return payload_token + @intFromBool(tree.tokenTag(payload_token) == .asterisk) + @as(Ast.TokenIndex, 2) * @intFromBool(decl == .switch_inline_tag_payload);
             },
         };
     }
@@ -276,23 +257,22 @@ pub const Scope = struct {
     pub const Tag = enum(u3) {
         /// `tree.nodeTag(ast_node)` is ContainerDecl or Root or ErrorSetDecl
         container,
-        /// index into `DocumentScope.extra`
-        /// Body:
-        ///     ast_node: Ast.Node.Index,
-        ///     usingnamespace_count: u32,
-        ///     usingnamespaces: [usingnamespace_count]u32,
-        /// `tree.nodeTag(ast_node)` is ContainerDecl or Root
-        container_usingnamespace,
         /// `tree.nodeTag(ast_node)` is FnProto
         function,
         /// `tree.nodeTag(ast_node)` is Block
         block,
         other,
+
+        pub fn isContainer(self: @This()) bool {
+            return switch (self) {
+                .container => true,
+                .block, .function, .other => false,
+            };
+        }
     };
 
     pub const Data = packed union {
         ast_node: Ast.Node.Index,
-        container_usingnamespace: u32,
     };
 
     pub const SmallLoc = packed struct {
@@ -346,6 +326,7 @@ pub const Scope = struct {
     };
 
     pub const OptionalIndex = enum(u32) {
+        root,
         none = std.math.maxInt(u32),
         _,
 
@@ -362,8 +343,8 @@ const ScopeContext = struct {
     doc_scope: *DocumentScope,
 
     current_scope: Scope.OptionalIndex = .none,
-    child_scopes_scratch: std.ArrayListUnmanaged(Scope.Index) = .empty,
-    child_declarations_scratch: std.ArrayListUnmanaged(Declaration.Index) = .empty,
+    child_scopes_scratch: std.ArrayList(Scope.Index) = .empty,
+    child_declarations_scratch: std.ArrayList(Declaration.Index) = .empty,
 
     fn deinit(context: *ScopeContext) void {
         context.child_scopes_scratch.deinit(context.allocator);
@@ -668,7 +649,6 @@ fn walkNode(
         => walkSwitchNode(context, tree, node_idx),
         .@"errdefer" => walkErrdeferNode(context, tree, node_idx),
 
-        .@"usingnamespace",
         .@"defer",
         .bool_not,
         .negation,
@@ -676,7 +656,6 @@ fn walkNode(
         .negation_wrap,
         .address_of,
         .@"try",
-        .@"await",
         .optional_type,
         .deref,
         .@"suspend",
@@ -753,8 +732,6 @@ fn walkNode(
         .struct_init_one_comma,
         .call_one,
         .call_one_comma,
-        .async_call_one,
-        .async_call_one_comma,
         .switch_case_one,
         .switch_case_inline_one,
         .container_field_init,
@@ -784,15 +761,14 @@ fn walkNode(
         .struct_init_comma,
         .call,
         .call_comma,
-        .async_call,
-        .async_call_comma,
         .switch_case,
         .switch_case_inline,
         .builtin_call,
         .builtin_call_comma,
         .container_field,
-        .@"asm",
+        .asm_legacy,
         .asm_simple,
+        .@"asm",
 
         .grouped_expression,
         .field_access,
@@ -829,8 +805,6 @@ noinline fn walkContainerDecl(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    const allocator = context.allocator;
-
     var buf: [2]Ast.Node.Index = undefined;
     const container_decl = tree.fullContainerDecl(&buf, node_idx).?;
 
@@ -851,16 +825,10 @@ noinline fn walkContainerDecl(
         locToSmallLoc(offsets.nodeToLoc(tree, node_idx)),
     );
 
-    var uses: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
-    defer uses.deinit(allocator);
-
     for (container_decl.ast.members) |decl| {
         try walkNode(context, tree, decl);
 
         switch (tree.nodeTag(decl)) {
-            .@"usingnamespace" => {
-                try uses.append(allocator, decl);
-            },
             .test_decl,
             .@"comptime",
             => continue,
@@ -919,17 +887,6 @@ noinline fn walkContainerDecl(
     }
 
     try scope.finalize();
-
-    if (uses.items.len != 0) {
-        const scope_data = &context.doc_scope.scopes.items(.data)[@intFromEnum(scope.scope)];
-        scope_data.tag = .container_usingnamespace;
-        scope_data.data = .{ .container_usingnamespace = @intCast(context.doc_scope.extra.items.len) };
-
-        try context.doc_scope.extra.ensureUnusedCapacity(allocator, uses.items.len + 2);
-        context.doc_scope.extra.appendAssumeCapacity(@intFromEnum(node_idx));
-        context.doc_scope.extra.appendAssumeCapacity(@intCast(uses.items.len));
-        context.doc_scope.extra.appendSliceAssumeCapacity(@ptrCast(uses.items));
-    }
 }
 
 noinline fn walkErrorSetNode(
@@ -1273,10 +1230,28 @@ noinline fn walkSwitchNode(
 ) error{OutOfMemory}!void {
     const full = tree.fullSwitch(node_idx).?;
 
+    const switch_scope = if (full.label_token) |label_token| blk: {
+        const scope = try context.startScope(
+            .other,
+            .{ .ast_node = node_idx },
+            locToSmallLoc(offsets.nodeToLoc(tree, node_idx)),
+        );
+        try scope.pushDeclaration(
+            label_token,
+            .{ .label = .{ .identifier = label_token, .block = node_idx } },
+            .label,
+        );
+        break :blk scope;
+    } else null;
+
     try walkNode(context, tree, full.ast.condition);
 
     for (full.ast.cases, 0..) |case, case_index| {
         const switch_case: Ast.full.SwitchCase = tree.fullSwitchCase(case).?;
+
+        for (switch_case.ast.values) |case_value| {
+            try walkNode(context, tree, case_value);
+        }
 
         if (switch_case.payload_token) |payload_token| {
             const name_token = payload_token + @intFromBool(tree.tokenTag(payload_token) == .asterisk);
@@ -1287,11 +1262,22 @@ noinline fn walkSwitchNode(
                 .{ .switch_payload = .{ .node = node_idx, .case_index = @intCast(case_index) } },
                 .other,
             );
+            if (name_token + 2 < tree.tokens.len and
+                tree.tokenTag(name_token + 1) == .comma and
+                tree.tokenTag(name_token + 2) == .identifier)
+            {
+                try expr_scope.pushDeclaration(
+                    name_token + 2,
+                    .{ .switch_inline_tag_payload = .{ .node = node_idx, .case_index = @intCast(case_index) } },
+                    .other,
+                );
+            }
             try expr_scope.finalize();
         } else {
             try walkNode(context, tree, switch_case.ast.target_expr);
         }
     }
+    if (switch_scope) |scope| try scope.finalize();
 }
 
 noinline fn walkErrdeferNode(
@@ -1360,21 +1346,6 @@ pub fn getScopeParent(
     return doc_scope.scopes.items(.parent_scope)[@intFromEnum(scope)];
 }
 
-pub fn getScopeUsingnamespaceNodesConst(
-    doc_scope: DocumentScope,
-    scope: Scope.Index,
-) []const Ast.Node.Index {
-    const data = doc_scope.scopes.items(.data)[@intFromEnum(scope)];
-    switch (data.tag) {
-        .container_usingnamespace => {
-            const start = data.data.container_usingnamespace;
-            const len = doc_scope.extra.items[start + 1];
-            return @ptrCast(doc_scope.extra.items[start + 2 .. start + 2 + len]);
-        },
-        else => return &.{},
-    }
-}
-
 pub fn getScopeAstNode(
     doc_scope: DocumentScope,
     scope: Scope.Index,
@@ -1384,7 +1355,6 @@ pub fn getScopeAstNode(
     const data = slice.items(.data)[@intFromEnum(scope)];
 
     return switch (data.tag) {
-        .container_usingnamespace => @as(Ast.Node.Index, @enumFromInt(doc_scope.extra.items[data.data.container_usingnamespace])),
         .container, .function, .block => data.data.ast_node,
         .other => null,
     };

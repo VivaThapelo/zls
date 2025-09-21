@@ -1,27 +1,27 @@
 //! Custom unit testing utilities similar to `std.testing`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const DocumentScope = @import("DocumentScope.zig");
 
 pub const print_ast = @import("print_ast.zig");
 
 pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!void {
-    var expected_stringified: std.ArrayListUnmanaged(u8) = .empty;
-    defer expected_stringified.deinit(std.testing.allocator);
+    const allocator = std.testing.allocator;
 
-    var actual_stringified: std.ArrayListUnmanaged(u8) = .empty;
-    defer actual_stringified.deinit(std.testing.allocator);
-
-    const options: std.json.StringifyOptions = .{
+    const options: std.json.Stringify.Options = .{
         .whitespace = .indent_2,
         .emit_null_optional_fields = false,
     };
 
-    std.json.stringify(expected, options, expected_stringified.writer(std.testing.allocator)) catch @panic("OOM");
-    std.json.stringify(actual, options, actual_stringified.writer(std.testing.allocator)) catch @panic("OOM");
+    const expected_stringified = std.json.Stringify.valueAlloc(allocator, expected, options) catch @panic("OOM");
+    defer allocator.free(expected_stringified);
 
-    if (std.mem.eql(u8, expected_stringified.items, actual_stringified.items)) return;
-    renderLineDiff(std.testing.allocator, expected_stringified.items, actual_stringified.items);
+    const actual_stringified = std.json.Stringify.valueAlloc(allocator, actual, options) catch @panic("OOM");
+    defer allocator.free(actual_stringified);
+
+    if (std.mem.eql(u8, expected_stringified, actual_stringified)) return;
+    renderLineDiff(allocator, expected_stringified, actual_stringified);
     return error.TestExpectedEqual;
 }
 
@@ -32,7 +32,7 @@ pub fn expectEqualStrings(expected: []const u8, actual: []const u8) error{TestEx
 }
 
 pub fn printDocumentScope(doc_scope: DocumentScope) void {
-    if (!std.debug.runtime_safety) @compileError("this function should only be used in debug mode!");
+    if (builtin.mode != .Debug) @compileError("this function should only be used in debug mode!");
 
     for (0..doc_scope.scopes.len) |index| {
         const scope_index: DocumentScope.Scope.Index = @enumFromInt(index);
@@ -44,7 +44,6 @@ pub fn printDocumentScope(doc_scope: DocumentScope) void {
             \\  ast node: {?}
             \\  parent: {}
             \\  child scopes: {any}
-            \\  usingnamespaces: {any}
             \\  decls:
             \\
         , .{
@@ -54,7 +53,6 @@ pub fn printDocumentScope(doc_scope: DocumentScope) void {
             doc_scope.getScopeAstNode(scope_index),
             doc_scope.getScopeParent(scope_index),
             doc_scope.getScopeChildScopesConst(scope_index),
-            doc_scope.getScopeUsingnamespaceNodesConst(scope_index),
         });
 
         for (doc_scope.getScopeDeclarationsConst(scope_index)) |decl| {
@@ -238,24 +236,26 @@ pub fn renderLineDiff(
     std.debug.print("\n======================================\n", .{});
     std.debug.print("\n============ difference: =============\n", .{});
 
-    const stderr = std.io.getStdErr();
-    const tty_config = std.io.tty.detectConfig(stderr);
+    const stderr = std.fs.File.stderr();
+    const tty_config = std.Io.tty.detectConfig(stderr);
+    var file_writer = stderr.writer(&.{});
+    const writer = &file_writer.interface;
 
     for (diff_list.items(.operation), diff_list.items(.text)) |op, text| {
-        tty_config.setColor(stderr.writer(), switch (op) {
+        tty_config.setColor(writer, switch (op) {
             .insert => .green,
             .delete => .red,
             .equal => .reset,
         }) catch {};
-        stderr.writeAll(switch (op) {
+        writer.writeAll(switch (op) {
             .insert => "+ ",
             .delete => "- ",
             .equal => "  ",
         }) catch {};
         printLine(text);
     }
-    tty_config.setColor(stderr.writer(), .reset) catch {};
-    stderr.writeAll("␃") catch {}; // End of Text symbol (ETX)
+    tty_config.setColor(writer, .reset) catch {};
+    writer.writeAll("␃") catch {}; // End of Text symbol (ETX)
     std.debug.print("\n======================================\n", .{});
 }
 

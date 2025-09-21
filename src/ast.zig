@@ -116,8 +116,8 @@ pub fn ptrTypeBitRange(tree: Ast, node: Node.Index) full.PtrType {
     });
 }
 
-fn fullAsmComponents(tree: Ast, info: full.Asm.Components) full.Asm {
-    var result: full.Asm = .{
+fn legacyAsmComponents(tree: Ast, info: full.AsmLegacy.Components) full.AsmLegacy {
+    var result: full.AsmLegacy = .{
         .ast = info,
         .volatile_token = null,
         .inputs = &.{},
@@ -179,6 +179,41 @@ fn fullAsmComponents(tree: Ast, info: full.Asm.Components) full.Asm {
     return result;
 }
 
+fn fullAsmComponents(tree: Ast, info: full.Asm.Components) full.Asm {
+    var result: full.Asm = .{
+        .ast = info,
+        .volatile_token = null,
+        .inputs = &.{},
+        .outputs = &.{},
+    };
+    if (info.asm_token + 1 < tree.tokens.len and tree.tokenTag(info.asm_token + 1) == .keyword_volatile) {
+        result.volatile_token = info.asm_token + 1;
+    }
+    const outputs_end: usize = for (info.items, 0..) |item, i| {
+        switch (tree.nodeTag(item)) {
+            .asm_output => continue,
+            else => break i,
+        }
+    } else info.items.len;
+
+    result.outputs = info.items[0..outputs_end];
+    result.inputs = info.items[outputs_end..];
+
+    return result;
+}
+
+pub fn asmLegacy(tree: Ast, node: Node.Index) full.AsmLegacy {
+    const template, const extra_index = tree.nodeData(node).node_and_extra;
+    const extra = tree.extraData(extra_index, Node.AsmLegacy);
+    const items = tree.extraDataSlice(.{ .start = extra.items_start, .end = extra.items_end }, Node.Index);
+    return legacyAsmComponents(tree, .{
+        .asm_token = tree.nodeMainToken(node),
+        .template = template,
+        .items = items,
+        .rparen = extra.rparen,
+    });
+}
+
 pub fn asmSimple(tree: Ast, node: Node.Index) full.Asm {
     const template, const rparen = tree.nodeData(node).node_and_token;
     return fullAsmComponents(tree, .{
@@ -186,6 +221,7 @@ pub fn asmSimple(tree: Ast, node: Node.Index) full.Asm {
         .template = template,
         .items = &.{},
         .rparen = rparen,
+        .clobbers = .none,
     });
 }
 
@@ -197,6 +233,7 @@ pub fn asmFull(tree: Ast, node: Node.Index) full.Asm {
         .asm_token = tree.nodeMainToken(node),
         .template = template,
         .items = items,
+        .clobbers = extra.clobbers,
         .rparen = extra.rparen,
     });
 }
@@ -445,14 +482,12 @@ pub fn lastToken(tree: Ast, node: Node.Index) Ast.TokenIndex {
     const last_token = while (true) switch (tree.nodeTag(n)) {
         .root => return @intCast(tree.tokens.len - 1),
 
-        .@"usingnamespace",
         .bool_not,
         .negation,
         .bit_not,
         .negation_wrap,
         .address_of,
         .@"try",
-        .@"await",
         .optional_type,
         .@"suspend",
         .@"resume",
@@ -656,6 +691,11 @@ pub fn lastToken(tree: Ast, node: Node.Index) Ast.TokenIndex {
             const index = @intFromEnum(extra_index) + extra.inputs + @intFromBool(extra.has_else);
             n = @enumFromInt(tree.extra_data[index]);
         },
+        .asm_legacy => {
+            _, const extra_index = tree.nodeData(n).node_and_extra;
+            const extra = tree.extraData(extra_index, Node.AsmLegacy);
+            break extra.rparen;
+        },
         .@"asm" => {
             _, const extra_index = tree.nodeData(n).node_and_extra;
             const extra = tree.extraData(extra_index, Node.Asm);
@@ -712,12 +752,8 @@ pub fn lastToken(tree: Ast, node: Node.Index) Ast.TokenIndex {
 
         .call_one,
         .call_one_comma,
-        .async_call_one,
-        .async_call_one_comma,
         .call,
         .call_comma,
-        .async_call,
-        .async_call_comma,
         => |tag| {
             var buffer: [1]Node.Index = undefined;
             const call = tree.fullCall(&buffer, n).?;
@@ -726,8 +762,8 @@ pub fn lastToken(tree: Ast, node: Node.Index) Ast.TokenIndex {
                 break tree.nodeMainToken(n);
             } else {
                 const has_comma = switch (tag) {
-                    .call_one, .async_call_one, .call, .async_call => false,
-                    .call_one_comma, .async_call_one_comma, .call_comma, .async_call_comma => true,
+                    .call_one, .call => false,
+                    .call_one_comma, .call_comma => true,
                     else => unreachable,
                 };
                 end_offset += @intFromBool(has_comma);
@@ -798,7 +834,7 @@ pub fn lastToken(tree: Ast, node: Node.Index) Ast.TokenIndex {
                     var i: u32 = switch (tag) {
                         .container_decl_two, .container_decl_two_trailing => 2, // lbrace + rbrace
                         .tagged_union_two, .tagged_union_two_trailing => 5, // (enum) {}
-                        else => @panic(@tagName(tag)),
+                        else => unreachable,
                     };
                     while (tree.tokenTag(tree.nodeMainToken(n) + i) == .container_doc_comment) i += 1;
                     end_offset += i;
@@ -1080,7 +1116,7 @@ pub fn iterateChildren(
 ) Error!void {
     const ctx = struct {
         fn inner(ctx: *const anyopaque, t: Ast, n: Ast.Node.Index) anyerror!void {
-            return callback(@as(*const @TypeOf(context), @alignCast(@ptrCast(ctx))).*, t, n);
+            return callback(@as(*const @TypeOf(context), @ptrCast(@alignCast(ctx))).*, t, n);
         }
     };
     if (iterateChildrenTypeErased(tree, node, @ptrCast(&context), &ctx.inner)) |_| {
@@ -1090,6 +1126,46 @@ pub fn iterateChildren(
     }
 }
 
+test "iterateChildren - fn_proto_* inside of fn_proto" {
+    const allocator = std.testing.allocator;
+
+    var tree: std.zig.Ast = try .parse(
+        allocator,
+        \\pub fn nextAge(age: u32) u32 {
+        \\  return age + 1;
+        \\}
+    ,
+        .zig,
+    );
+    defer tree.deinit(allocator);
+
+    var children_tags: std.ArrayList(Ast.Node.Tag) = .empty;
+    defer children_tags.deinit(allocator);
+
+    const Context = struct {
+        accumulator: *std.ArrayList(Ast.Node.Tag),
+        ally: std.mem.Allocator,
+
+        fn callback(self: @This(), ast: Ast, child_node: Ast.Node.Index) !void {
+            try self.accumulator.append(self.ally, ast.nodeTag(child_node));
+        }
+    };
+
+    const fn_decl = tree.rootDecls()[0];
+    try iterateChildren(
+        tree,
+        fn_decl,
+        Context{ .accumulator = &children_tags, .ally = allocator },
+        error{OutOfMemory},
+        Context.callback,
+    );
+
+    try std.testing.expectEqualSlices(Ast.Node.Tag, &.{
+        .fn_proto_simple, // i.e., `pub fn nextAge(age: u32) u32`
+        .block_two_semicolon, // i.e., `return { return age + 1; }`
+    }, children_tags.items);
+}
+
 fn iterateChildrenTypeErased(
     tree: Ast,
     node: Ast.Node.Index,
@@ -1097,14 +1173,12 @@ fn iterateChildrenTypeErased(
     callback: *const fn (*const anyopaque, Ast, Ast.Node.Index) anyerror!void,
 ) anyerror!void {
     switch (tree.nodeTag(node)) {
-        .@"usingnamespace",
         .bool_not,
         .negation,
         .bit_not,
         .negation_wrap,
         .address_of,
         .@"try",
-        .@"await",
         .optional_type,
         .deref,
         .@"suspend",
@@ -1185,8 +1259,6 @@ fn iterateChildrenTypeErased(
 
         .call_one,
         .call_one_comma,
-        .async_call_one,
-        .async_call_one_comma,
         .struct_init_one,
         .struct_init_one_comma,
         .container_field_init,
@@ -1230,7 +1302,9 @@ fn iterateChildrenTypeErased(
         },
         .test_decl, .@"errdefer" => try callback(context, tree, tree.nodeData(node).opt_token_and_node[1]),
         .anyframe_type => try callback(context, tree, tree.nodeData(node).token_and_node[1]),
-        .@"break" => {
+        .@"break",
+        .@"continue",
+        => {
             if (tree.nodeData(node).opt_token_and_opt_node[1].unwrap()) |rhs| {
                 try callback(context, tree, rhs);
             }
@@ -1335,8 +1409,6 @@ fn iterateChildrenTypeErased(
 
         .call,
         .call_comma,
-        .async_call,
-        .async_call_comma,
         => {
             const call = tree.callFull(node).ast;
             try callback(context, tree, call.fn_expr);
@@ -1396,13 +1468,15 @@ fn iterateChildrenTypeErased(
             try callback(context, tree, if_ast.then_expr);
             if (if_ast.else_expr.unwrap()) |else_expr| try callback(context, tree, else_expr);
         },
-
+        .fn_decl => {
+            try callback(context, tree, tree.nodeData(node).node_and_node[0]);
+            try callback(context, tree, tree.nodeData(node).node_and_node[1]);
+        },
         .fn_proto_simple,
         .fn_proto_multi,
         .fn_proto_one,
         .fn_proto,
-        .fn_decl,
-        => |tag| {
+        => {
             var buffer: [1]Node.Index = undefined;
             const fn_proto = tree.fullFnProto(&buffer, node).?;
 
@@ -1415,9 +1489,6 @@ fn iterateChildrenTypeErased(
             if (fn_proto.ast.section_expr.unwrap()) |section_expr| try callback(context, tree, section_expr);
             if (fn_proto.ast.callconv_expr.unwrap()) |callconv_expr| try callback(context, tree, callconv_expr);
             if (fn_proto.ast.return_type.unwrap()) |return_type| try callback(context, tree, return_type);
-            if (tag == .fn_decl) {
-                try callback(context, tree, tree.nodeData(node).node_and_node[1]);
-            }
         },
 
         .container_decl_arg,
@@ -1447,7 +1518,9 @@ fn iterateChildrenTypeErased(
             if (field.value_expr.unwrap()) |value_expr| try callback(context, tree, value_expr);
         },
 
-        .@"asm" => {
+        .asm_legacy,
+        .@"asm",
+        => {
             const asm_node = tree.asmFull(node);
 
             try callback(context, tree, asm_node.ast.template);
@@ -1470,7 +1543,6 @@ fn iterateChildrenTypeErased(
         .asm_input,
         => unreachable,
 
-        .@"continue",
         .anyframe_literal,
         .char_literal,
         .number_literal,
@@ -1497,7 +1569,7 @@ pub fn iterateChildrenRecursive(
     const RecursiveContext = struct {
         fn recursive_callback(ctx: *const anyopaque, ast: Ast, child_node: Ast.Node.Index) anyerror!void {
             std.debug.assert(child_node != .root);
-            try callback(@as(*const @TypeOf(context), @alignCast(@ptrCast(ctx))).*, ast, child_node);
+            try callback(@as(*const @TypeOf(context), @ptrCast(@alignCast(ctx))).*, ast, child_node);
             try iterateChildrenTypeErased(ast, child_node, ctx, recursive_callback);
         }
     };
@@ -1516,18 +1588,40 @@ pub fn iterateChildrenRecursive(
 pub fn nodeChildrenAlloc(allocator: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}![]Ast.Node.Index {
     const Context = struct {
         allocator: std.mem.Allocator,
-        children: *std.ArrayListUnmanaged(Ast.Node.Index),
+        children: *std.ArrayList(Ast.Node.Index),
         fn callback(self: @This(), ast: Ast, child_node: Ast.Node.Index) error{OutOfMemory}!void {
             _ = ast;
-            if (child_node == 0) return;
             try self.children.append(self.allocator, child_node);
         }
     };
 
-    var children: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
-    errdefer children.deinit();
+    var children: std.ArrayList(Ast.Node.Index) = .empty;
+    errdefer children.deinit(allocator);
     try iterateChildren(tree, node, Context{ .allocator = allocator, .children = &children }, error{OutOfMemory}, Context.callback);
-    return children.toOwnedSlice();
+    return children.toOwnedSlice(allocator);
+}
+
+test nodeChildrenAlloc {
+    const allocator = std.testing.allocator;
+
+    var tree = try std.zig.Ast.parse(
+        allocator,
+        "const namespace = struct { field_a: u32 };",
+        .zig,
+    );
+    defer tree.deinit(allocator);
+
+    const namespace = tree.rootDecls()[0];
+
+    const children = try nodeChildrenAlloc(
+        allocator,
+        tree,
+        namespace,
+    );
+    defer allocator.free(children);
+
+    try std.testing.expectEqual(1, children.len);
+    try std.testing.expectEqualStrings("struct { field_a: u32 }", tree.getNodeSource(children[0]));
 }
 
 /// returns the children of the given node.
@@ -1536,18 +1630,42 @@ pub fn nodeChildrenAlloc(allocator: std.mem.Allocator, tree: Ast, node: Ast.Node
 pub fn nodeChildrenRecursiveAlloc(allocator: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}![]Ast.Node.Index {
     const Context = struct {
         allocator: std.mem.Allocator,
-        children: *std.ArrayListUnmanaged(Ast.Node.Index),
+        children: *std.ArrayList(Ast.Node.Index),
         fn callback(self: @This(), ast: Ast, child_node: Ast.Node.Index) error{OutOfMemory}!void {
             _ = ast;
-            if (child_node == 0) return;
             try self.children.append(self.allocator, child_node);
         }
     };
 
-    var children: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
-    errdefer children.deinit();
-    try iterateChildrenRecursive(tree, node, .{ .allocator = allocator, .children = &children }, Context.callback);
+    var children: std.ArrayList(Ast.Node.Index) = .empty;
+    errdefer children.deinit(allocator);
+    try iterateChildrenRecursive(tree, node, Context{ .allocator = allocator, .children = &children }, error{OutOfMemory}, Context.callback);
     return children.toOwnedSlice(allocator);
+}
+
+test nodeChildrenRecursiveAlloc {
+    const allocator = std.testing.allocator;
+
+    var tree = try std.zig.Ast.parse(
+        allocator,
+        "const namespace = struct { field_a: u32 };",
+        .zig,
+    );
+    defer tree.deinit(allocator);
+
+    const namespace = tree.rootDecls()[0];
+
+    const children = try nodeChildrenRecursiveAlloc(
+        allocator,
+        tree,
+        namespace,
+    );
+    defer allocator.free(children);
+
+    try std.testing.expectEqual(3, children.len);
+    try std.testing.expectEqualStrings("struct { field_a: u32 }", tree.getNodeSource(children[0]));
+    try std.testing.expectEqualStrings("field_a: u32", tree.getNodeSource(children[1]));
+    try std.testing.expectEqualStrings("u32", tree.getNodeSource(children[2]));
 }
 
 /// returns a list of nodes that overlap with the given source code index.
@@ -1559,7 +1677,7 @@ pub fn nodesOverlappingIndex(allocator: std.mem.Allocator, tree: Ast, index: usi
     const Context = struct {
         index: usize,
         allocator: std.mem.Allocator,
-        nodes: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
+        nodes: std.ArrayList(Ast.Node.Index) = .empty,
 
         pub fn append(self: *@This(), ast: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
             std.debug.assert(node != .root);
@@ -1572,9 +1690,44 @@ pub fn nodesOverlappingIndex(allocator: std.mem.Allocator, tree: Ast, index: usi
     };
 
     var context: Context = .{ .index = index, .allocator = allocator };
+    defer context.nodes.deinit(allocator);
     try iterateChildren(tree, .root, &context, error{OutOfMemory}, Context.append);
     try context.nodes.append(allocator, .root);
     return try context.nodes.toOwnedSlice(allocator);
+}
+
+/// returns a list of nodes that overlap with the given source code index.
+/// the list may include nodes that were discarded during error recovery in the Zig parser.
+/// sorted from smallest to largest.
+/// caller owns the returned memory.
+/// this function can be removed when the parser has been improved.
+pub fn nodesOverlappingIndexIncludingParseErrors(allocator: std.mem.Allocator, tree: Ast, source_index: usize) error{OutOfMemory}![]Ast.Node.Index {
+    const NodeLoc = struct {
+        node: Ast.Node.Index,
+        loc: offsets.Loc,
+
+        fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+            return rhs.loc.start < lhs.loc.start and lhs.loc.end < rhs.loc.end;
+        }
+    };
+
+    var node_locs: std.ArrayList(NodeLoc) = .empty;
+    defer node_locs.deinit(allocator);
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const loc = offsets.nodeToLoc(tree, node);
+        if (loc.start <= source_index and source_index <= loc.end) {
+            try node_locs.append(allocator, .{ .node = node, .loc = loc });
+        }
+    }
+
+    std.mem.sort(NodeLoc, node_locs.items, {}, NodeLoc.lessThan);
+
+    const nodes = try allocator.alloc(Ast.Node.Index, node_locs.items.len);
+    for (node_locs.items, nodes) |node_loc, *node| {
+        node.* = node_loc.node;
+    }
+    return nodes;
 }
 
 /// returns a list of nodes that together encloses the given source code range
@@ -1584,8 +1737,8 @@ pub fn nodesAtLoc(allocator: std.mem.Allocator, tree: Ast, loc: offsets.Loc) err
 
     const Context = struct {
         allocator: std.mem.Allocator,
-        nodes: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
-        locs: std.ArrayListUnmanaged(offsets.Loc) = .empty,
+        nodes: std.ArrayList(Ast.Node.Index) = .empty,
+        locs: std.ArrayList(offsets.Loc) = .empty,
 
         pub fn append(self: *@This(), ast: Ast, node: Ast.Node.Index) !void {
             std.debug.assert(node != .root);
@@ -1735,4 +1888,40 @@ test smallestEnclosingSubrange {
         children[1..3],
         children[result4.start .. result4.start + result4.len],
     );
+}
+
+pub fn indexOfBreakTarget(
+    tree: Ast,
+    nodes: []const Ast.Node.Index,
+    break_label_maybe: ?[]const u8,
+) ?usize {
+    for (nodes, 0..) |node, index| {
+        if (fullFor(tree, node)) |for_node| {
+            const break_label = break_label_maybe orelse return index;
+            const for_label = tree.tokenSlice(for_node.label_token orelse continue);
+            if (std.mem.eql(u8, break_label, for_label)) return index;
+        } else if (fullWhile(tree, node)) |while_node| {
+            const break_label = break_label_maybe orelse return index;
+            const while_label = tree.tokenSlice(while_node.label_token orelse continue);
+            if (std.mem.eql(u8, break_label, while_label)) return index;
+        } else if (tree.fullSwitch(node)) |switch_node| {
+            const break_label = break_label_maybe orelse continue;
+            const switch_label = tree.tokenSlice(switch_node.label_token orelse continue);
+            if (std.mem.eql(u8, break_label, switch_label)) return index;
+        } else switch (tree.nodeTag(node)) {
+            .block,
+            .block_semicolon,
+            .block_two,
+            .block_two_semicolon,
+            => {
+                const break_label = break_label_maybe orelse continue;
+                const block_label_token = blockLabel(tree, node) orelse continue;
+                const block_label = tree.tokenSlice(block_label_token);
+
+                if (std.mem.eql(u8, break_label, block_label)) return index;
+            },
+            else => {},
+        }
+    }
+    return null;
 }

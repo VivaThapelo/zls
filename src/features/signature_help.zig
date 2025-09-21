@@ -20,32 +20,40 @@ fn fnProtoToSignatureInfo(
     func_type: Analyser.Type,
     markup_kind: types.MarkupKind,
 ) !types.SignatureInformation {
-    const fn_node_handle = func_type.data.other; // this assumes that function types can only be Ast nodes
-    const fn_node = fn_node_handle.node;
-    const fn_handle = fn_node_handle.handle;
-    const tree = fn_handle.tree;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, fn_node).?;
+    const info = func_type.data.function;
 
-    const label = Analyser.getFunctionSignature(tree, proto);
-    const proto_comments = try Analyser.getDocComments(arena, tree, fn_node);
+    const label = try analyser.stringifyFunction(.{
+        .info = info,
+        .include_fn_keyword = true,
+        .include_name = true,
+        .parameters = .{ .show = .{
+            .include_modifiers = true,
+            .include_names = true,
+            .include_types = true,
+        } },
+        .include_return_type = true,
+        .snippet_placeholders = false,
+    });
 
     const arg_idx = if (skip_self_param) blk: {
         const has_self_param = try analyser.hasSelfParam(func_type);
         break :blk commas + @intFromBool(has_self_param);
     } else commas;
 
-    var params: std.ArrayListUnmanaged(types.ParameterInformation) = .empty;
-    var param_it = proto.iterate(&tree);
-    while (ast.nextFnParam(&param_it)) |param| {
-        const param_comments = if (param.first_doc_comment) |dc|
-            try Analyser.collectDocComments(arena, tree, dc, false)
-        else
-            null;
+    var params: std.ArrayList(types.ParameterInformation) = .empty;
+    for (info.parameters) |param| {
+        const param_label = try analyser.stringifyParameter(.{
+            .info = param,
+            .index = 0, // we don't want a comma in the label
+            .include_modifier = true,
+            .include_name = true,
+            .include_type = true,
+            .snippet_placeholders = false,
+        });
 
         try params.append(arena, .{
-            .label = .{ .string = ast.paramSlice(tree, param, false) },
-            .documentation = if (param_comments) |comment| .{ .MarkupContent = .{
+            .label = .{ .string = param_label },
+            .documentation = if (param.doc_comments) |comment| .{ .MarkupContent = .{
                 .kind = markup_kind,
                 .value = comment,
             } } else null,
@@ -53,7 +61,7 @@ fn fnProtoToSignatureInfo(
     }
     return types.SignatureInformation{
         .label = label,
-        .documentation = if (proto_comments) |comment| .{ .MarkupContent = .{
+        .documentation = if (info.doc_comments) |comment| .{ .MarkupContent = .{
             .kind = markup_kind,
             .value = comment,
         } } else null,
@@ -70,7 +78,13 @@ pub fn getSignatureInfo(
     markup_kind: types.MarkupKind,
 ) !?types.SignatureInformation {
     const document_scope = try handle.getDocumentScope();
-    const innermost_block = Analyser.innermostBlockScope(document_scope, absolute_index);
+    const innermost_block_scope = Analyser.innermostScopeAtIndexWithTag(document_scope, absolute_index, .init(.{
+        .block = true,
+        .container = true,
+        .function = true,
+        .other = false,
+    })).unwrap().?;
+    const innermost_block = document_scope.getScopeAstNode(innermost_block_scope).?;
     const tree = handle.tree;
 
     // Use the innermost scope to determine the earliest token we would need
@@ -117,9 +131,9 @@ pub fn getSignatureInfo(
             };
         }
     };
-    var symbol_stack: std.ArrayListUnmanaged(StackSymbol) = try .initCapacity(arena, 8);
+    var symbol_stack: std.ArrayList(StackSymbol) = try .initCapacity(arena, 8);
     var curr_commas: u32 = 0;
-    var comma_stack: std.ArrayListUnmanaged(u32) = try .initCapacity(arena, 4);
+    var comma_stack: std.ArrayList(u32) = try .initCapacity(arena, 4);
     var curr_token = last_token;
     while (curr_token >= first_token and curr_token != 0) : (curr_token -= 1) {
         switch (tree.tokenTag(curr_token)) {
@@ -185,11 +199,11 @@ pub fn getSignatureInfo(
                     const builtin = data.builtins.get(tree.tokenSlice(expr_last_token)) orelse return null;
                     const param_infos = try arena.alloc(
                         types.ParameterInformation,
-                        builtin.arguments.len,
+                        builtin.parameters.len,
                     );
-                    for (param_infos, builtin.arguments) |*info, argument| {
+                    for (param_infos, builtin.parameters) |*info, parameter| {
                         info.* = .{
-                            .label = .{ .string = argument },
+                            .label = .{ .string = parameter.signature },
                             .documentation = null,
                         };
                     }

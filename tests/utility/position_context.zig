@@ -9,6 +9,12 @@ const offsets = zls.offsets;
 
 const allocator = std.testing.allocator;
 
+test "keyword" {
+    try testContext(
+        \\const foo = <cursor><loc>while</loc> (true) {};
+    , .keyword, .{ .lookahead = true });
+}
+
 test "var_access" {
     try testContext(
         \\const foo = <cursor><loc>identifier</loc>;
@@ -45,7 +51,7 @@ test "function.payload" {
     , .var_access, .{ .lookahead = true });
     try testContext(
         \\    fn foo() !<loc>Str</loc> <cursor>{
-    , .var_access, .{ .lookahead = true });
+    , .var_access, .{ .lookahead = false });
 }
 
 test "function.error_set" {
@@ -208,7 +214,10 @@ test "field access across multiple lines" {
 test "builtin" {
     try testContext(
         \\var foo = <cursor>@
-    , .empty, .{});
+    , .empty, .{ .lookahead = false });
+    try testContext(
+        \\var foo = <loc><cursor>@</loc>
+    , .builtin, .{ .lookahead = true });
 
     try testContext(
         \\var foo = <loc>@<cursor></loc>
@@ -235,7 +244,13 @@ test "builtin" {
 
     try testContext(
         \\var foo: <cursor>@
-    , .empty, .{});
+    , .empty, .{ .lookahead = false });
+    try testContext(
+        \\var foo: <loc><cursor>@</loc>
+    , .builtin, .{ .lookahead = true });
+    try testContext(
+        \\var foo: <loc><cursor>@</loc>();
+    , .builtin, .{ .lookahead = true });
     try testContext(
         \\var foo: <loc><cursor>@Thi</loc>();
     , .builtin, .{ .lookahead = true });
@@ -261,6 +276,26 @@ test "builtin" {
     try testContext(
         \\fn foo() void { <loc>@setRuntime</loc><cursor>(false); };
     , .builtin, .{});
+
+    try testContext(
+        \\if (true) <cursor><loc>@setRuntime</loc>(false)
+    , .builtin, .{ .lookahead = true });
+    try testContext(
+        \\if (true) <loc>@<cursor>setRuntime</loc>(false)
+    , .builtin, .{ .lookahead = true });
+    try testContext(
+        \\if (true) <loc>@set<cursor>Runtime</loc>(false)
+    , .builtin, .{ .lookahead = true });
+    try testContext(
+        \\if (true) <loc>@setRuntime</loc><cursor>(false)
+    , .builtin, .{});
+
+    try testContext(
+        \\const foo = (<loc><cursor>@</loc>())
+    , .builtin, .{ .lookahead = true });
+    try testContext(
+        \\const foo = (<loc><cursor>@trap</loc>())
+    , .builtin, .{ .lookahead = true });
 }
 
 test "comment" {
@@ -422,9 +457,21 @@ test "enum literal" {
     , .enum_literal, .{});
     try testContext(
         \\var foo = <cursor>.;
-    , .empty, .{});
+    , .empty, .{ .lookahead = false });
+    try testContext(
+        \\var foo = <loc><cursor>.</loc>;
+    , .enum_literal, .{ .lookahead = true });
     try testContext(
         \\var foo = <loc>.</loc><cursor>;
+    , .enum_literal, .{});
+}
+
+test "enum literal after break" {
+    try testContext(
+        \\break <loc>.<cursor>foo</loc>;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\break <loc>.foo<cursor></loc>;
     , .enum_literal, .{});
 }
 
@@ -434,6 +481,84 @@ test "enum literal after break label" {
     , .enum_literal, .{ .lookahead = true });
     try testContext(
         \\break :blk <loc>.foo<cursor></loc>;
+    , .enum_literal, .{});
+}
+
+test "enum literal in 'then' expression of 'if' statement" {
+    try testContext(
+        \\var foo = if (bar) <loc>.<cursor>foo</loc> else .bar;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = if (bar) <loc>.foo<cursor></loc> else .bar;
+    , .enum_literal, .{});
+}
+
+test "enum literal in 'else' expression of 'if' statement" {
+    try testContext(
+        \\var foo = if (bar) .foo else <loc>.<cursor>bar</loc>;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = if (bar) .foo else <loc>.bar<cursor></loc>;
+    , .enum_literal, .{});
+}
+
+test "enum literal in body of 'while' loop" {
+    try testContext(
+        \\var foo = while (bar) <loc>.<cursor>foo</loc> else .bar;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = while (bar) <loc>.foo<cursor></loc> else .bar;
+    , .enum_literal, .{});
+    try testContext(
+        \\var foo = while (bar) |baz| <loc>.<cursor>foo</loc> else .bar;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = while (bar) |baz| <loc>.foo<cursor></loc> else .bar;
+    , .enum_literal, .{});
+}
+
+test "enum literal in 'else' expression of 'while' loop" {
+    try testContext(
+        \\var foo = while (bar) .foo else <loc>.<cursor>bar</loc>;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = while (bar) .foo else <loc>.bar<cursor></loc>;
+    , .enum_literal, .{});
+    try testContext(
+        \\var foo = while (bar) |baz| .foo else <loc>.<cursor>bar</loc>;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = while (bar) |baz| .foo else <loc>.bar<cursor></loc>;
+    , .enum_literal, .{});
+}
+
+test "enum literal in body of 'for' loop" {
+    try testContext(
+        \\var foo = for (bar) <loc>.<cursor>foo</loc> else .bar;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = for (bar) <loc>.foo<cursor></loc> else .bar;
+    , .enum_literal, .{});
+    try testContext(
+        \\var foo = for (bar) |baz| <loc>.<cursor>foo</loc> else .bar;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = for (bar) |baz| <loc>.foo<cursor></loc> else .bar;
+    , .enum_literal, .{});
+}
+
+test "enum literal in 'else' expression of 'for' loop" {
+    try testContext(
+        \\var foo = for (bar) .foo else <loc>.<cursor>bar</loc>;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = for (bar) .foo else <loc>.bar<cursor></loc>;
+    , .enum_literal, .{});
+    try testContext(
+        \\var foo = for (bar) |baz| .foo else <loc>.<cursor>bar</loc>;
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = for (bar) |baz| .foo else <loc>.bar<cursor></loc>;
     , .enum_literal, .{});
 }
 
@@ -472,6 +597,15 @@ test "empty" {
     try testContext(
         \\try foo(arg, slice[0..<cursor>]);
     , .empty, .{});
+}
+
+test "inferred struct init as call argument" {
+    try testContext(
+        \\var foo = bar(<loc><cursor>.</loc>{});
+    , .enum_literal, .{ .lookahead = true });
+    try testContext(
+        \\var foo = bar(<loc>.<cursor></loc>{});
+    , .enum_literal, .{});
 }
 
 const Options = struct {
@@ -528,7 +662,7 @@ fn testContext(source: []const u8, expected_tag: std.meta.Tag(Analyser.PositionC
     const new_source = try allocator.dupeZ(u8, phr.new_source);
     defer allocator.free(new_source);
 
-    var tree = try std.zig.Ast.parse(allocator, new_source, .zig);
+    var tree: std.zig.Ast = try .parse(allocator, new_source, .zig);
     defer tree.deinit(allocator);
 
     const ctx = try Analyser.getPositionContext(allocator, tree, cursor_index, lookahead);
@@ -544,12 +678,12 @@ fn testContext(source: []const u8, expected_tag: std.meta.Tag(Analyser.PositionC
     });
 
     if (std.meta.activeTag(ctx) != expected_tag) {
-        std.debug.print("Expected tag `{s}`, got `{s}`\n", .{ @tagName(expected_tag), @tagName(std.meta.activeTag(ctx)) });
+        std.debug.print("Expected tag `{t}`, got `{t}`\n", .{ expected_tag, std.meta.activeTag(ctx) });
         return error.DifferentTag;
     }
 
-    if (!std.meta.eql(expected_loc, ctx.loc())) {
-        if (ctx.loc()) |actual_loc| {
+    if (!std.meta.eql(expected_loc, ctx.loc(&tree))) {
+        if (ctx.loc(&tree)) |actual_loc| {
             try error_builder.msgAtLoc("actual range here", "file.zig", actual_loc, .info, .{});
         }
 
@@ -558,7 +692,7 @@ fn testContext(source: []const u8, expected_tag: std.meta.Tag(Analyser.PositionC
         }
 
         std.debug.print("expected_loc: {?}\n", .{expected_loc});
-        std.debug.print("actual_loc  : {?}\n", .{ctx.loc()});
+        std.debug.print("actual_loc  : {?}\n", .{ctx.loc(&tree)});
         return error.DifferentRange;
     }
 }

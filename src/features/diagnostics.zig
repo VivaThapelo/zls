@@ -26,6 +26,8 @@ pub fn generateDiagnostics(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
+    const config = &server.config_manager.config;
+
     if (handle.tree.errors.len == 0) {
         const tracy_zone2 = tracy.traceNamed(@src(), "ast-check");
         defer tracy_zone2.end();
@@ -60,19 +62,19 @@ pub fn generateDiagnostics(
         errdefer arena_allocator.deinit();
         const arena = arena_allocator.allocator();
 
-        var diagnostics: std.ArrayListUnmanaged(types.Diagnostic) = .empty;
+        var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
 
-        if (server.getAutofixMode() != .none and handle.tree.mode == .zig) {
-            var analyser = server.initAnalyser(handle);
+        if (handle.tree.mode == .zig) {
+            var analyser = server.initAnalyser(arena, handle);
             defer analyser.deinit();
             try code_actions.collectAutoDiscardDiagnostics(&analyser, handle, arena, &diagnostics, server.offset_encoding);
         }
 
-        if (server.config.warn_style and handle.tree.mode == .zig) {
+        if (config.warn_style and handle.tree.mode == .zig) {
             try collectWarnStyleDiagnostics(handle.tree, arena, &diagnostics, server.offset_encoding);
         }
 
-        if (server.config.highlight_global_var_declarations and handle.tree.mode == .zig) {
+        if (config.highlight_global_var_declarations and handle.tree.mode == .zig) {
             try collectGlobalVarDiagnostics(handle.tree, arena, &diagnostics, server.offset_encoding);
         }
 
@@ -97,28 +99,28 @@ fn collectParseDiagnostics(tree: Ast, eb: *std.zig.ErrorBundle.Wip) error{OutOfM
 
     const allocator = eb.gpa;
 
-    var msg_buffer: std.ArrayListUnmanaged(u8) = .empty;
-    defer msg_buffer.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    var notes: std.ArrayListUnmanaged(std.zig.ErrorBundle.MessageIndex) = .empty;
+    var notes: std.ArrayList(std.zig.ErrorBundle.MessageIndex) = .empty;
     defer notes.deinit(allocator);
 
     const current_error = tree.errors[0];
     for (tree.errors[1..]) |err| {
         if (!err.is_note) break;
 
-        msg_buffer.clearRetainingCapacity();
-        try tree.renderError(err, msg_buffer.writer(allocator));
+        aw.clearRetainingCapacity();
+        tree.renderError(err, &aw.writer) catch return error.OutOfMemory;
         try notes.append(allocator, try eb.addErrorMessage(.{
-            .msg = try eb.addString(msg_buffer.items),
+            .msg = try eb.addString(aw.written()),
             .src_loc = try errorBundleSourceLocationFromToken(tree, eb, err.token),
         }));
     }
 
-    msg_buffer.clearRetainingCapacity();
-    try tree.renderError(current_error, msg_buffer.writer(allocator));
+    aw.clearRetainingCapacity();
+    tree.renderError(current_error, &aw.writer) catch return error.OutOfMemory;
     try eb.addRootErrorMessage(.{
-        .msg = try eb.addString(msg_buffer.items),
+        .msg = try eb.addString(aw.written()),
         .src_loc = try errorBundleSourceLocationFromToken(tree, eb, current_error.token),
         .notes_len = @intCast(notes.items.len),
     });
@@ -150,7 +152,7 @@ fn errorBundleSourceLocationFromToken(
 fn collectWarnStyleDiagnostics(
     tree: Ast,
     arena: std.mem.Allocator,
-    diagnostics: *std.ArrayListUnmanaged(types.Diagnostic),
+    diagnostics: *std.ArrayList(types.Diagnostic),
     offset_encoding: offsets.Encoding,
 ) error{OutOfMemory}!void {
     const tracy_zone = tracy.trace(@src());
@@ -231,7 +233,7 @@ fn collectWarnStyleDiagnostics(
 fn collectGlobalVarDiagnostics(
     tree: Ast,
     arena: std.mem.Allocator,
-    diagnostics: *std.ArrayListUnmanaged(types.Diagnostic),
+    diagnostics: *std.ArrayList(types.Diagnostic),
     offset_encoding: offsets.Encoding,
 ) error{OutOfMemory}!void {
     const tracy_zone = tracy.trace(@src());
@@ -269,15 +271,16 @@ pub fn getAstCheckDiagnostics(server: *Server, handle: *DocumentStore.Handle) er
     defer tracy_zone.end();
 
     std.debug.assert(handle.tree.errors.len == 0);
+    const config = &server.config_manager.config;
 
     if (std.process.can_spawn and
-        server.config.prefer_ast_check_as_child_process and
+        config.prefer_ast_check_as_child_process and
         handle.tree.mode == .zig and // TODO pass `--zon` if available
-        server.config.zig_exe_path != null)
+        config.zig_exe_path != null)
     {
         return getErrorBundleFromAstCheck(
             server.allocator,
-            server.config.zig_exe_path.?,
+            config.zig_exe_path.?,
             &server.zig_ast_check_lock,
             handle.tree.source,
         ) catch |err| {
@@ -314,6 +317,9 @@ fn getErrorBundleFromAstCheck(
     zig_ast_check_lock: *std.Thread.Mutex,
     source: [:0]const u8,
 ) !std.zig.ErrorBundle {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
     comptime std.debug.assert(std.process.can_spawn);
 
     var stderr_bytes: []u8 = "";
@@ -337,7 +343,7 @@ fn getErrorBundleFromAstCheck(
 
         process.stdin = null;
 
-        stderr_bytes = try process.stderr.?.readToEndAlloc(allocator, 16 * 1024 * 1024);
+        stderr_bytes = try readToEndAlloc(process.stderr.?, allocator, .limited(16 * 1024 * 1024));
 
         const term = process.wait() catch |err| {
             log.warn("Failed to await zig ast-check process, error: {}", .{err});
@@ -347,17 +353,33 @@ fn getErrorBundleFromAstCheck(
         if (term != .Exited) return .empty;
     }
 
+    return try getErrorBundleFromStderr(allocator, stderr_bytes, true, .{ .single_source_file = source });
+}
+
+pub fn getErrorBundleFromStderr(
+    allocator: std.mem.Allocator,
+    stderr_bytes: []const u8,
+    ignore_src_path: bool,
+    path_resolution: union(enum) {
+        single_source_file: [:0]const u8,
+        dynamic: struct {
+            document_store: *DocumentStore,
+            /// file paths in stderr may be relative so we need to figure out the base path
+            base_path: []const u8,
+        },
+    },
+) !std.zig.ErrorBundle {
     if (stderr_bytes.len == 0) return .empty;
 
     var last_error_message: ?std.zig.ErrorBundle.ErrorMessage = null;
-    var notes: std.ArrayListUnmanaged(std.zig.ErrorBundle.MessageIndex) = .empty;
+    var notes: std.ArrayList(std.zig.ErrorBundle.MessageIndex) = .empty;
     defer notes.deinit(allocator);
 
     var error_bundle: std.zig.ErrorBundle.Wip = undefined;
     try error_bundle.init(allocator);
     defer error_bundle.deinit();
 
-    const eb_file_path = try error_bundle.addString("");
+    const eb_empty_string = try error_bundle.addString("");
 
     var line_iterator = std.mem.splitScalar(u8, stderr_bytes, '\n');
     while (line_iterator.next()) |line| {
@@ -368,31 +390,53 @@ fn getErrorBundleFromAstCheck(
         const column_string = pos_and_diag_iterator.next() orelse continue;
         const msg = pos_and_diag_iterator.rest();
 
-        if (!std.mem.eql(u8, src_path, "<stdin>")) continue;
+        const eb_src_path = if (ignore_src_path) eb_empty_string else try error_bundle.addString(src_path);
 
         // zig uses utf-8 encoding for character offsets
         const utf8_position: types.Position = .{
             .line = (std.fmt.parseInt(u32, line_string, 10) catch continue) -| 1,
             .character = (std.fmt.parseInt(u32, column_string, 10) catch continue) -| 1,
         };
-        const source_index = offsets.positionToIndex(source, utf8_position, .@"utf-8");
-        const source_line = offsets.lineSliceAtIndex(source, source_index);
 
-        var loc: offsets.Loc = .{ .start = source_index, .end = source_index };
+        const maybe_source: ?[:0]const u8 = switch (path_resolution) {
+            .single_source_file => |source| source,
+            .dynamic => |dynamic| source: {
+                const file_path = try std.fs.path.resolve(allocator, &.{ dynamic.base_path, src_path });
+                defer allocator.free(file_path);
+                const file_uri = try URI.fromPath(allocator, file_path);
+                defer allocator.free(file_uri);
+                const handle = dynamic.document_store.getOrLoadHandle(file_uri) orelse break :source null;
+                break :source handle.tree.source;
+            },
+        };
 
-        while (loc.end < source.len and Analyser.isSymbolChar(source[loc.end])) {
-            loc.end += 1;
-        }
+        const src_loc = if (maybe_source) |source| src_loc: {
+            const source_index = offsets.positionToIndex(source, utf8_position, .@"utf-8");
+            const source_loc = offsets.lineLocAtIndex(source, source_index);
 
-        const src_loc = try error_bundle.addSourceLocation(.{
-            .src_path = eb_file_path,
-            .line = utf8_position.line,
-            .column = utf8_position.character,
-            .span_start = @intCast(loc.start),
-            .span_main = @intCast(source_index),
-            .span_end = @intCast(loc.end),
-            .source_line = try error_bundle.addString(source_line),
-        });
+            const loc = offsets.tokenIndexToLoc(source, source_index);
+
+            break :src_loc try error_bundle.addSourceLocation(.{
+                .src_path = eb_src_path,
+                .line = utf8_position.line,
+                .column = utf8_position.character,
+                // span_start <= span_main <= span_end <= source_loc.end
+                .span_start = @intCast(@min(source_index, loc.start)),
+                .span_main = @intCast(source_index),
+                .span_end = @intCast(@min(@max(source_index, loc.end), source_loc.end)),
+                .source_line = try error_bundle.addString(offsets.locToSlice(source, source_loc)),
+            });
+        } else src_loc: {
+            break :src_loc try error_bundle.addSourceLocation(.{
+                .src_path = eb_src_path,
+                .line = utf8_position.line,
+                .column = utf8_position.character,
+                .span_start = 0,
+                .span_main = 0,
+                .span_end = 0,
+                .source_line = 0,
+            });
+        };
 
         if (std.mem.startsWith(u8, msg, " note: ")) {
             try notes.append(allocator, try error_bundle.addErrorMessage(.{
@@ -437,7 +481,6 @@ pub const BuildOnSave = struct {
     thread: std.Thread,
 
     const shared = @import("../build_runner/shared.zig");
-    const Transport = shared.Transport;
     const ServerToClient = shared.ServerToClient;
 
     pub const InitOptions = struct {
@@ -465,7 +508,7 @@ pub const BuildOnSave = struct {
             options.zig_lib_path,
             "--watch",
         };
-        var argv: std.ArrayListUnmanaged([]const u8) = try .initCapacity(
+        var argv: std.ArrayList([]const u8) = try .initCapacity(
             options.allocator,
             base_args.len + options.build_on_save_args.len + @intFromBool(options.check_step_only),
         );
@@ -544,13 +587,6 @@ pub const BuildOnSave = struct {
     ) void {
         defer allocator.free(workspace_path);
 
-        var transport: Transport = .init(.{
-            .gpa = allocator,
-            .in = child_process.stdout.?,
-            .out = child_process.stdin.?,
-        });
-        defer transport.deinit();
-
         var diagnostic_tags: std.AutoArrayHashMapUnmanaged(DiagnosticsCollection.Tag, void) = .empty;
         defer diagnostic_tags.deinit(allocator);
 
@@ -559,23 +595,33 @@ pub const BuildOnSave = struct {
             collection.publishDiagnostics() catch {};
         }
 
-        while (true) {
-            const header = transport.receiveMessage(null) catch |err| switch (err) {
-                error.EndOfStream => {
-                    log.debug("zig build runner process has exited", .{});
-                    return;
-                },
-                else => {
+        var poller = std.Io.poll(allocator, enum { stdout }, .{ .stdout = child_process.stdout.? });
+        defer poller.deinit();
+        const stdout = poller.reader(.stdout);
+
+        pool: while (true) {
+            while (stdout.buffered().len < @sizeOf(ServerToClient.Header)) {
+                const keep_polling = poller.poll() catch |err| {
                     log.err("failed to receive message from zig build runner: {}", .{err});
                     return;
-                },
-            };
+                };
+                if (!keep_polling) break :pool;
+            }
+            const header = stdout.takeStruct(ServerToClient.Header, .little) catch unreachable;
+            while (stdout.buffered().len < header.bytes_len) {
+                const keep_polling = poller.poll() catch |err| {
+                    log.err("failed to receive message from zig build runner: {}", .{err});
+                    return;
+                };
+                if (!keep_polling) break :pool;
+            }
+            const body = stdout.take(header.bytes_len) catch unreachable;
 
-            switch (@as(ServerToClient.Tag, @enumFromInt(header.tag))) {
+            switch (header.tag) {
                 .watch_error_bundle => {
                     handleWatchErrorBundle(
                         allocator,
-                        &transport,
+                        body,
                         collection,
                         workspace_path,
                         &diagnostic_tags,
@@ -589,22 +635,46 @@ pub const BuildOnSave = struct {
                 },
             }
         }
+
+        log.debug("zig build runner process has exited", .{});
+
+        const stderr = if (child_process.stderr) |stderr|
+            readToEndAlloc(stderr, allocator, .limited(16 * 1024 * 1024)) catch ""
+        else
+            "";
+        defer allocator.free(stderr);
+
+        if (stderr.len != 0) {
+            log.debug("build runner stderr:\n{s}", .{stderr});
+        }
     }
 
     fn handleWatchErrorBundle(
         allocator: std.mem.Allocator,
-        transport: *Transport,
+        body: []u8,
         collection: *DiagnosticsCollection,
         workspace_path: []const u8,
         diagnostic_tags: *std.AutoArrayHashMapUnmanaged(DiagnosticsCollection.Tag, void),
-    ) !void {
-        const header = try transport.reader().readStructEndian(ServerToClient.ErrorBundle, .little);
+    ) (error{ OutOfMemory, InvalidMessage } || std.posix.WriteError)!void {
+        var reader: std.Io.Reader = .fixed(body);
 
-        const extra = try transport.receiveSlice(allocator, u32, header.extra_len);
+        const header = reader.takeStruct(ServerToClient.ErrorBundle, .little) catch return error.InvalidMessage;
+
+        const extra = reader.readSliceEndianAlloc(allocator, u32, header.extra_len, .little) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.EndOfStream => return error.InvalidMessage,
+            error.ReadFailed => unreachable,
+        };
         defer allocator.free(extra);
 
-        const string_bytes = try transport.receiveBytes(allocator, header.string_bytes_len);
+        const string_bytes = reader.readAlloc(allocator, header.string_bytes_len) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.EndOfStream => return error.InvalidMessage,
+            error.ReadFailed => unreachable,
+        };
         defer allocator.free(string_bytes);
+
+        if (reader.bufferedLen() != 0) return error.InvalidMessage; // ensure that we read the entire body
 
         const error_bundle: std.zig.ErrorBundle = .{ .string_bytes = string_bytes, .extra = extra };
 
@@ -628,7 +698,7 @@ fn terminateChildProcessReportError(
     kind: enum { wait, kill },
 ) bool {
     const stderr = if (child_process.stderr) |stderr|
-        stderr.readToEndAlloc(allocator, 16 * 1024 * 1024) catch ""
+        readToEndAlloc(stderr, allocator, .limited(16 * 1024 * 1024)) catch ""
     else
         "";
     defer allocator.free(stderr);
@@ -651,12 +721,25 @@ fn terminateChildProcessReportError(
         },
         else => {
             if (stderr.len != 0) {
-                log.warn("{s} exitied abnormally: {s}\nstderr:\n{s}", .{ name, @tagName(term), stderr });
+                log.warn("{s} exitied abnormally: {t}\nstderr:\n{s}", .{ name, term, stderr });
             } else {
-                log.warn("{s} exitied abnormally: {s}", .{ name, @tagName(term) });
+                log.warn("{s} exitied abnormally: {t}", .{ name, term });
             }
         },
     }
 
     return true;
+}
+
+fn readToEndAlloc(
+    file: std.fs.File,
+    allocator: std.mem.Allocator,
+    limit: std.Io.Limit,
+) (std.fs.File.ReadError || error{ OutOfMemory, StreamTooLong })![]u8 {
+    var buffer: [1024]u8 = undefined;
+    var file_reader = file.readerStreaming(&buffer);
+    return file_reader.interface.allocRemaining(allocator, limit) catch |err| switch (err) {
+        error.ReadFailed => return file_reader.err.?,
+        error.OutOfMemory, error.StreamTooLong => |e| return e,
+    };
 }

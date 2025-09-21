@@ -19,8 +19,8 @@ pub const Builder = struct {
     offset_encoding: offsets.Encoding,
     only_kinds: ?std.EnumSet(std.meta.Tag(types.CodeActionKind)),
 
-    actions: std.ArrayListUnmanaged(types.CodeAction) = .empty,
-    fixall_text_edits: std.ArrayListUnmanaged(types.TextEdit) = .empty,
+    actions: std.ArrayList(types.CodeAction) = .empty,
+    fixall_text_edits: std.ArrayList(types.TextEdit) = .empty,
 
     pub fn generateCodeAction(
         builder: *Builder,
@@ -162,7 +162,7 @@ pub fn generateStringLiteralCodeActions(
     if (!std.unicode.utf8ValidateSlice(parsed)) return;
     const with_slashes = try std.mem.replaceOwned(u8, builder.arena, parsed, "\n", "\n    \\\\"); // Hardcoded 4 spaces
 
-    var result: std.ArrayListUnmanaged(u8) = try .initCapacity(builder.arena, with_slashes.len + 3);
+    var result: std.ArrayList(u8) = try .initCapacity(builder.arena, with_slashes.len + 3);
     result.appendSliceAssumeCapacity("\\\\");
     result.appendSliceAssumeCapacity(with_slashes);
     result.appendAssumeCapacity('\n');
@@ -193,7 +193,7 @@ pub fn generateMultilineStringCodeActions(
 
     // collect the text in the literal
     const loc = offsets.tokensToLoc(builder.handle.tree, @intCast(start), @intCast(end));
-    var str_escaped: std.ArrayListUnmanaged(u8) = try .initCapacity(builder.arena, 2 * (loc.end - loc.start));
+    var str_escaped: std.ArrayList(u8) = try .initCapacity(builder.arena, 2 * (loc.end - loc.start));
     str_escaped.appendAssumeCapacity('"');
     for (start..end) |i| {
         std.debug.assert(tree.tokenTag(@intCast(i)) == .multiline_string_literal_line);
@@ -247,7 +247,7 @@ pub fn collectAutoDiscardDiagnostics(
     analyser: *Analyser,
     handle: *DocumentStore.Handle,
     arena: std.mem.Allocator,
-    diagnostics: *std.ArrayListUnmanaged(types.Diagnostic),
+    diagnostics: *std.ArrayList(types.Diagnostic),
     offset_encoding: offsets.Encoding,
 ) error{OutOfMemory}!void {
     const tracy_zone = tracy.trace(@src());
@@ -587,6 +587,36 @@ fn handleVariableNeverMutated(builder: *Builder, loc: offsets.Loc) !void {
     });
 }
 
+const ImportPlacement = enum {
+    top,
+    bottom,
+};
+
+fn analyzeImportPlacement(tree: Ast, imports: []const ImportDecl) ImportPlacement {
+    const root_decls = tree.rootDecls();
+
+    if (root_decls.len == 0 or imports.len == 0) return .top;
+
+    const first_import = imports[0].var_decl;
+    const last_import = imports[imports.len - 1].var_decl;
+
+    const first_decl = root_decls[0];
+    const last_decl = root_decls[root_decls.len - 1];
+
+    const starts_with_import = first_decl == first_import;
+    const ends_with_import = last_decl == last_import;
+
+    if (starts_with_import and ends_with_import) {
+        // If there are only imports, choose "top" to avoid unnecessary newlines.
+        // Otherwise, having an import at the bottom is a strong signal that that is the preferred style.
+        const has_gaps = root_decls.len != imports.len;
+
+        return if (has_gaps) .bottom else .top;
+    }
+
+    return if (!starts_with_import and ends_with_import) .bottom else .top;
+}
+
 fn handleUnorganizedImport(builder: *Builder) !void {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
@@ -603,30 +633,46 @@ fn handleUnorganizedImport(builder: *Builder) !void {
     // The optimization is disabled because it does not detect the case where imports and other decls are mixed
     // if (std.sort.isSorted(ImportDecl, imports.items, tree, ImportDecl.lessThan)) return;
 
+    const placement = analyzeImportPlacement(tree, imports);
+
     const sorted_imports = try builder.arena.dupe(ImportDecl, imports);
     std.mem.sort(ImportDecl, sorted_imports, tree, ImportDecl.lessThan);
 
-    var edits: std.ArrayListUnmanaged(types.TextEdit) = .empty;
+    var edits: std.ArrayList(types.TextEdit) = .empty;
 
     // add sorted imports
     {
-        var new_text: std.ArrayListUnmanaged(u8) = .empty;
-        var writer = new_text.writer(builder.arena);
+        var new_text: std.ArrayList(u8) = .empty;
+
+        if (placement == .bottom) {
+            try new_text.append(builder.arena, '\n');
+        }
 
         for (sorted_imports, 0..) |import_decl, i| {
             if (i != 0 and ImportDecl.addSeperator(sorted_imports[i - 1], import_decl)) {
                 try new_text.append(builder.arena, '\n');
             }
 
-            try writer.print("{s}\n", .{offsets.locToSlice(tree.source, import_decl.getLoc(tree, false))});
+            try new_text.print(builder.arena, "{s}\n", .{offsets.locToSlice(tree.source, import_decl.getLoc(tree, false))});
         }
-        try writer.writeByte('\n');
 
-        const first_token = std.mem.indexOfNone(Token.Tag, tree.tokens.items(.tag), &.{.container_doc_comment}) orelse tree.tokens.len;
-        const insert_pos = offsets.tokenToPosition(tree, @intCast(first_token), builder.offset_encoding);
+        try new_text.append(builder.arena, '\n');
+
+        const range: offsets.Range = switch (placement) {
+            .top => blk: {
+                // Current behavior: insert at top after doc comments
+                const first_token = std.mem.indexOfNone(Token.Tag, tree.tokens.items(.tag), &.{.container_doc_comment}) orelse tree.tokens.len;
+                const insert_pos = offsets.tokenToPosition(tree, @intCast(first_token), builder.offset_encoding);
+                break :blk .{ .start = insert_pos, .end = insert_pos };
+            },
+            .bottom => blk: {
+                // Current behavior: insert at eof
+                break :blk offsets.tokenToRange(tree, @intCast(tree.tokens.len - 1), builder.offset_encoding);
+            },
+        };
 
         try edits.append(builder.arena, .{
-            .range = .{ .start = insert_pos, .end = insert_pos },
+            .range = range,
             .newText = new_text.items,
         });
     }
@@ -921,7 +967,7 @@ fn detectIndentation(source: []const u8) []const u8 {
         if (source[i] == '\\') continue; // multi-line strings might as well.
         return source[i - space_count .. i];
     }
-    return " " ** 4; // recommended style
+    return "    "; // recommended style
 }
 
 // attempts to converts a slice of text into camelcase 'FUNCTION_NAME' -> 'functionName'
@@ -932,7 +978,7 @@ fn createCamelcaseText(allocator: std.mem.Allocator, identifier: []const u8) ![]
     const num_separators = std.mem.count(u8, trimmed_identifier, "_");
 
     const new_text_len = trimmed_identifier.len - num_separators;
-    var new_text: std.ArrayListUnmanaged(u8) = try .initCapacity(allocator, new_text_len);
+    var new_text: std.ArrayList(u8) = try .initCapacity(allocator, new_text_len);
     errdefer new_text.deinit(allocator);
 
     var idx: usize = 0;
@@ -996,7 +1042,7 @@ fn createDiscardText(
         identifier_name.len +
         "; // autofix".len +
         if (add_suffix_newline) 1 + indent.len else 0;
-    var new_text: std.ArrayListUnmanaged(u8) = try .initCapacity(builder.arena, new_text_len);
+    var new_text: std.ArrayList(u8) = try .initCapacity(builder.arena, new_text_len);
 
     new_text.appendAssumeCapacity('\n');
     new_text.appendSliceAssumeCapacity(indent);

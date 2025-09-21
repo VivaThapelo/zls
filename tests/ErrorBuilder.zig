@@ -8,6 +8,7 @@ const offsets = zls.offsets;
 const ErrorBuilder = @This();
 
 allocator: std.mem.Allocator,
+encoding: offsets.Encoding = .@"utf-16",
 files: std.StringArrayHashMapUnmanaged(File) = .empty,
 message_count: usize = 0,
 /// similar to `git diff --unified`
@@ -50,26 +51,26 @@ pub fn removeFile(builder: *ErrorBuilder, name: []const u8) void {
 
 pub fn msgAtLoc(
     builder: *ErrorBuilder,
-    comptime fmt: []const u8,
+    comptime fmt_str: []const u8,
     file_name: []const u8,
     loc: offsets.Loc,
     level: std.log.Level,
     args: anytype,
 ) error{OutOfMemory}!void {
-    const message = try std.fmt.allocPrint(builder.allocator, fmt, args);
+    const message = try std.fmt.allocPrint(builder.allocator, fmt_str, args);
     errdefer builder.allocator.free(message);
     try builder.appendMessage(message, file_name, loc, level);
 }
 
 pub fn msgAtIndex(
     builder: *ErrorBuilder,
-    comptime fmt: []const u8,
+    comptime fmt_str: []const u8,
     file_name: []const u8,
     source_index: usize,
     level: std.log.Level,
     args: anytype,
 ) error{OutOfMemory}!void {
-    return msgAtLoc(builder, fmt, file_name, .{ .start = source_index, .end = source_index }, level, args);
+    return msgAtLoc(builder, fmt_str, file_name, .{ .start = source_index, .end = source_index }, level, args);
 }
 
 pub fn hasMessages(builder: ErrorBuilder) bool {
@@ -101,55 +102,13 @@ pub fn removeUnusedFiles(builder: *ErrorBuilder) void {
     }
 }
 
-pub const FormatContext = struct {
-    builder: *const ErrorBuilder,
-    tty_config: ?std.io.tty.Config = null,
-};
-
-pub fn format(
-    builder: *const ErrorBuilder,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
-    _ = options;
-    if (fmt.len != 0) std.fmt.invalidFmtError(fmt, builder.*);
-    try write(.{ .builder = builder }, writer);
-}
-
-pub fn formatContext(
-    context: FormatContext,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
-    _ = options;
-    if (fmt.len != 0) std.fmt.invalidFmtError(fmt, context.builder.*);
-    try write(context, writer);
-}
-
-pub fn fmtContext(builder: *const ErrorBuilder, tty_config: std.io.tty.Config) std.fmt.Formatter(formatContext) {
-    return .{ .data = .{
-        .builder = builder,
-        .tty_config = tty_config,
-    } };
-}
-
-pub fn writeDebug(builder: *const ErrorBuilder) void {
-    const stderr = std.io.getStdErr();
-    const tty_config = std.io.tty.detectConfig(stderr);
-    // does zig trim the output or why is this needed?
-    stderr.writeAll(" ") catch return;
-    std.debug.print("\n{}\n", .{builder.fmtContext(tty_config)});
-}
-
 //
 //
 //
 
-fn assertFmt(ok: bool, comptime fmt: []const u8, args: anytype) void {
+fn assertFmt(ok: bool, comptime fmt_str: []const u8, args: anytype) void {
     if (builtin.mode == .Debug or builtin.is_test) {
-        if (!ok) std.debug.panic(fmt, args);
+        if (!ok) std.debug.panic(fmt_str, args);
     } else {
         std.debug.assert(ok);
     }
@@ -206,17 +165,58 @@ fn appendMessage(
     builder.message_count += 1;
 }
 
-fn write(context: FormatContext, writer: anytype) @TypeOf(writer).Error!void {
+pub const FormatContext = struct {
+    builder: *const ErrorBuilder,
+    tty_config: ?std.Io.tty.Config,
+};
+
+pub fn fmt(builder: *const ErrorBuilder, tty_config: std.Io.tty.Config) std.fmt.Alt(FormatContext, render) {
+    return .{ .data = .{
+        .builder = builder,
+        .tty_config = tty_config,
+    } };
+}
+
+pub fn writeDebug(builder: *const ErrorBuilder) void {
+    const stderr = std.fs.File.stderr();
+    const tty_config = std.Io.tty.detectConfig(stderr);
+    // does zig trim the output or why is this needed?
+    stderr.writeAll(" ") catch return;
+    std.debug.print("\n{f}\n", .{builder.fmt(tty_config)});
+}
+
+pub fn format(builder: *const ErrorBuilder, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try render(.{ .builder = builder, .tty_config = null }, writer);
+}
+
+fn render(context: FormatContext, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     const builder = context.builder;
+    var first = true;
     for (builder.files.keys(), builder.files.values()) |file_name, file| {
         if (file.messages.items.len == 0) continue;
+        defer first = false;
 
         std.debug.assert(std.sort.isSorted(MsgItem, file.messages.items, file.source, MsgItem.lessThan));
 
-        if (builder.file_name_visibility == .always or
-            builder.file_name_visibility == .multi_file and builder.files.count() > 1)
-        {
-            try writer.print("{s}:\n", .{file_name});
+        switch (builder.file_name_visibility) {
+            .never => {
+                if (!first) {
+                    try writer.writeByte('\n');
+                }
+            },
+            .multi_file => {
+                if (!first) {
+                    try writer.writeAll("\n\n");
+                }
+                if (builder.files.count() > 1) {
+                    try writer.print("{s}:\n", .{file_name});
+                }
+            },
+            .always => {
+                if (!first) {
+                    try writer.writeAll("\n\n");
+                }
+            },
         }
 
         var it: MsgItemIterator = .{
@@ -243,13 +243,43 @@ fn write(context: FormatContext, writer: anytype) @TypeOf(writer).Error!void {
                 };
             defer last_line_end_with_unified = unified_loc.end;
 
-            if (last_line_end_with_unified == 0) { // start
-                try writer.writeAll(file.source[unified_loc.start..line_loc.end]);
-            } else if (last_line_end_with_unified < unified_loc.start) { // no intersection
-                try writer.writeAll(file.source[last_line_end..@min(last_line_end_with_unified + 1, file.source.len)]);
-                try writer.writeAll(file.source[unified_loc.start..line_loc.end]);
-            } else { // intersection (we can merge)
-                try writer.writeAll(file.source[last_line_end..line_loc.end]);
+            const intersection_state: enum {
+                start,
+                no_intersection,
+                intersection,
+            } = if (last_line_end_with_unified == 0)
+                .start
+            else if (last_line_end_with_unified + 1 < unified_loc.start)
+                .no_intersection
+            else
+                .intersection;
+
+            switch (intersection_state) {
+                .start => {},
+                .no_intersection => {
+                    try writer.writeAll(file.source[last_line_end..last_line_end_with_unified]);
+                    switch (builder.file_name_visibility) {
+                        .never => try writer.writeByte('\n'),
+                        .multi_file => try writer.writeAll("\n...\n"),
+                        .always => try writer.writeAll("\n\n"),
+                    }
+                },
+                .intersection => { // (we can merge)
+                    try writer.writeAll(file.source[last_line_end..line_loc.end]);
+                },
+            }
+
+            switch (intersection_state) {
+                .start,
+                .no_intersection,
+                => {
+                    if (builder.file_name_visibility == .always) {
+                        const pos = offsets.indexToPosition(file.source, some_line_source_index, builder.encoding);
+                        try writer.print("{s}:{}:{}:\n", .{ file_name, pos.line + 1, pos.character + 1 });
+                    }
+                    try writer.writeAll(file.source[unified_loc.start..line_loc.end]);
+                },
+                .intersection => {},
             }
 
             for (line_messages) |item| {
@@ -264,7 +294,7 @@ fn write(context: FormatContext, writer: anytype) @TypeOf(writer).Error!void {
                     .info => "info",
                     .debug => "debug",
                 };
-                const color: std.io.tty.Color = switch (item.level) {
+                const color: std.Io.tty.Color = switch (item.level) {
                     .err => .red,
                     .warn => .yellow,
                     .info => .white,
@@ -283,7 +313,7 @@ fn write(context: FormatContext, writer: anytype) @TypeOf(writer).Error!void {
 
 const File = struct {
     source: []const u8,
-    messages: std.ArrayListUnmanaged(MsgItem) = .empty,
+    messages: std.ArrayList(MsgItem) = .empty,
 };
 
 const MsgItem = struct {
@@ -353,7 +383,7 @@ test "ErrorBuilder - write" {
     var eb: ErrorBuilder = .init(std.testing.allocator);
     defer eb.deinit();
 
-    try std.testing.expectFmt("", "{}", .{eb});
+    try std.testing.expectFmt("", "{f}", .{eb});
 
     try eb.addFile("",
         \\The missile knows where it is at all times.
@@ -379,7 +409,7 @@ test "ErrorBuilder - write" {
         \\it was, it is able to obtain the deviation and its variation, which is called error.
     );
 
-    try std.testing.expectFmt("", "{}", .{eb});
+    try std.testing.expectFmt("", "{f}", .{eb});
 
     {
         eb.clearMessages();
@@ -389,7 +419,7 @@ test "ErrorBuilder - write" {
         try std.testing.expectFmt(
             \\(whichever is greater), it obtains a difference, or deviation.
             \\ ^^^^^^^^^^^^^^^^^^^^ warning: what about equality?
-        , "{}", .{eb});
+        , "{f}", .{eb});
     }
 
     {
@@ -402,7 +432,7 @@ test "ErrorBuilder - write" {
             \\By subtracting where it is from where it isn't, or where it isn't from where it is
             \\   ^^^^^^^^^^^ info: are safety checks enabled?
             \\(whichever is greater), it obtains a difference, or deviation.
-        , "{}", .{eb});
+        , "{f}", .{eb});
     }
 
     {
@@ -414,7 +444,7 @@ test "ErrorBuilder - write" {
             \\The missile knows where it is at all times.
             \\    ^^^^^^^ info: AAM or ASM?
             \\It knows this because it knows where it isn't.
-        , "{}", .{eb});
+        , "{f}", .{eb});
     }
 
     {
@@ -427,7 +457,7 @@ test "ErrorBuilder - write" {
             \\differentiating this from the algebraic sum of where it shouldn't be, and where
             \\it was, it is able to obtain the deviation and its variation, which is called error.
             \\                                                                              ^^^^^ error: reserved keyword!
-        , "{}", .{eb});
+        , "{f}", .{eb});
     }
 
     {
@@ -441,7 +471,7 @@ test "ErrorBuilder - write" {
             \\            ^^^^^ info: declared here
             \\It knows this because it knows where it isn't.
             \\                         ^^^^^ error: redeclaration of work 'knows'
-        , "{}", .{eb});
+        , "{f}", .{eb});
 
         eb.unified = 1;
         try std.testing.expectFmt(
@@ -450,7 +480,7 @@ test "ErrorBuilder - write" {
             \\It knows this because it knows where it isn't.
             \\                         ^^^^^ error: redeclaration of work 'knows'
             \\By subtracting where it is from where it isn't, or where it isn't from where it is
-        , "{}", .{eb});
+        , "{f}", .{eb});
     }
 
     {
@@ -464,7 +494,7 @@ test "ErrorBuilder - write" {
             \\            ^^^^^ info: declared here
             \\It knows this because it knows where it isn't.
             \\                         ^^^^^ error: redeclaration of work 'knows'
-        , "{}", .{eb});
+        , "{f}", .{eb});
 
         eb.unified = 1;
         try std.testing.expectFmt(
@@ -473,7 +503,7 @@ test "ErrorBuilder - write" {
             \\It knows this because it knows where it isn't.
             \\                         ^^^^^ error: redeclaration of work 'knows'
             \\By subtracting where it is from where it isn't, or where it isn't from where it is
-        , "{}", .{eb});
+        , "{f}", .{eb});
     }
 }
 
@@ -488,17 +518,162 @@ test "ErrorBuilder - write on empty file" {
     try std.testing.expectFmt(
         \\
         \\^ warning: why is this empty?
-    , "{}", .{eb});
+    , "{f}", .{eb});
 
     eb.unified = 0;
     try std.testing.expectFmt(
         \\
         \\^ warning: why is this empty?
-    , "{}", .{eb});
+    , "{f}", .{eb});
 
     eb.unified = 2;
     try std.testing.expectFmt(
         \\
         \\^ warning: why is this empty?
-    , "{}", .{eb});
+    , "{f}", .{eb});
+}
+
+test "ErrorBuilder - file name visibility" {
+    var eb: ErrorBuilder = .init(std.testing.allocator);
+    defer eb.deinit();
+
+    try eb.addFile("basic.zig",
+        \\// comment
+        \\const alpha: bool = true;
+        \\// comment
+        \\const beta: bool = false;
+        \\// comment
+        \\const gamma: type = bool;
+    );
+
+    try eb.addFile("array.zig",
+        \\// comment
+        \\const array_slice_open_runtime = some_array[runtime_index..];
+        \\// comment
+        \\const array_slice_0_2 = some_array[0..2];
+        \\// comment
+        \\const array_slice_0_2_sentinel = some_array[0..2 :0];
+        \\// comment
+        \\const array_slice_0_5 = some_array[0..5];
+        \\// comment
+        \\const array_slice_3_2 = some_array[3..2];
+        \\// comment
+        \\const array_slice_0_runtime = some_array[0..runtime_index];
+        \\// comment
+        \\const array_slice_with_sentinel = some_array[0..runtime_index :0];
+        \\// comment
+        \\const array_init = [length]u8{};
+        \\// comment
+        \\const array_init_inferred_len_0 = [_]u8{};
+        \\// comment
+        \\const array_init_inferred_len_3 = [_]u8{ 1, 2, 3 };
+    );
+
+    try eb.addFile("sentinel_value.zig",
+        \\// comment
+        \\const hw = "Hello, World!";
+        \\// comment
+        \\const h = hw[0..5];
+        \\// comment
+        \\const w = hw[7..];
+    );
+
+    try eb.msgAtLoc("this should be `*const [2:0]u8`", "array.zig", .{ .start = 143, .end = 167 }, .err, .{});
+    try eb.msgAtLoc("this should be `[:0]const u8`", "array.zig", .{ .start = 385, .end = 410 }, .err, .{});
+
+    try eb.msgAtLoc("this should be `*const [5]u8`", "sentinel_value.zig", .{ .start = 56, .end = 57 }, .err, .{});
+    try eb.msgAtLoc("this should be `*const [6:0]u8`", "sentinel_value.zig", .{ .start = 87, .end = 88 }, .err, .{});
+
+    eb.file_name_visibility = .multi_file;
+    try std.testing.expectFmt(
+        \\array.zig:
+        \\// comment
+        \\const array_slice_0_2 = some_array[0..2];
+        \\// comment
+        \\const array_slice_0_2_sentinel = some_array[0..2 :0];
+        \\      ^^^^^^^^^^^^^^^^^^^^^^^^ error: this should be `*const [2:0]u8`
+        \\// comment
+        \\const array_slice_0_5 = some_array[0..5];
+        \\// comment
+        \\...
+        \\// comment
+        \\const array_slice_0_runtime = some_array[0..runtime_index];
+        \\// comment
+        \\const array_slice_with_sentinel = some_array[0..runtime_index :0];
+        \\      ^^^^^^^^^^^^^^^^^^^^^^^^^ error: this should be `[:0]const u8`
+        \\// comment
+        \\const array_init = [length]u8{};
+        \\// comment
+        \\
+        \\sentinel_value.zig:
+        \\// comment
+        \\const hw = "Hello, World!";
+        \\// comment
+        \\const h = hw[0..5];
+        \\      ^ error: this should be `*const [5]u8`
+        \\// comment
+        \\const w = hw[7..];
+        \\      ^ error: this should be `*const [6:0]u8`
+    , "{f}", .{eb});
+
+    eb.file_name_visibility = .always;
+    try std.testing.expectFmt(
+        \\array.zig:6:7:
+        \\// comment
+        \\const array_slice_0_2 = some_array[0..2];
+        \\// comment
+        \\const array_slice_0_2_sentinel = some_array[0..2 :0];
+        \\      ^^^^^^^^^^^^^^^^^^^^^^^^ error: this should be `*const [2:0]u8`
+        \\// comment
+        \\const array_slice_0_5 = some_array[0..5];
+        \\// comment
+        \\
+        \\array.zig:14:7:
+        \\// comment
+        \\const array_slice_0_runtime = some_array[0..runtime_index];
+        \\// comment
+        \\const array_slice_with_sentinel = some_array[0..runtime_index :0];
+        \\      ^^^^^^^^^^^^^^^^^^^^^^^^^ error: this should be `[:0]const u8`
+        \\// comment
+        \\const array_init = [length]u8{};
+        \\// comment
+        \\
+        \\sentinel_value.zig:4:7:
+        \\// comment
+        \\const hw = "Hello, World!";
+        \\// comment
+        \\const h = hw[0..5];
+        \\      ^ error: this should be `*const [5]u8`
+        \\// comment
+        \\const w = hw[7..];
+        \\      ^ error: this should be `*const [6:0]u8`
+    , "{f}", .{eb});
+
+    eb.file_name_visibility = .never;
+    try std.testing.expectFmt(
+        \\// comment
+        \\const array_slice_0_2 = some_array[0..2];
+        \\// comment
+        \\const array_slice_0_2_sentinel = some_array[0..2 :0];
+        \\      ^^^^^^^^^^^^^^^^^^^^^^^^ error: this should be `*const [2:0]u8`
+        \\// comment
+        \\const array_slice_0_5 = some_array[0..5];
+        \\// comment
+        \\// comment
+        \\const array_slice_0_runtime = some_array[0..runtime_index];
+        \\// comment
+        \\const array_slice_with_sentinel = some_array[0..runtime_index :0];
+        \\      ^^^^^^^^^^^^^^^^^^^^^^^^^ error: this should be `[:0]const u8`
+        \\// comment
+        \\const array_init = [length]u8{};
+        \\// comment
+        \\// comment
+        \\const hw = "Hello, World!";
+        \\// comment
+        \\const h = hw[0..5];
+        \\      ^ error: this should be `*const [5]u8`
+        \\// comment
+        \\const w = hw[7..];
+        \\      ^ error: this should be `*const [6:0]u8`
+    , "{f}", .{eb});
 }

@@ -10,14 +10,13 @@ jobs:
   coverage:
     if: github.repository_owner == 'zigtools'
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: master
-
-      - run: zig env
 
       - name: Install kcov
         run: |
@@ -27,7 +26,7 @@ jobs:
       - name: Run Tests with kcov
         run: |
           kcov --version
-          zig build test -Dcoverage --summary all
+          zig build test -Dcoverage -Duse-llvm --summary all
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5

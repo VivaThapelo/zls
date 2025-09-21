@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
 
     zig-overlay.url = "github:mitchellh/zig-overlay";
     zig-overlay.inputs.nixpkgs.follows = "nixpkgs";
@@ -34,16 +34,17 @@
               meta.mainProgram = "zls";
               src = gitignoreSource ./.;
               nativeBuildInputs = [zig];
-              dontConfigure = true;
               dontInstall = true;
               doCheck = true;
+              configurePhase = ''
+                export ZIG_GLOBAL_CACHE_DIR=$TEMP/.cache
+              '';
               buildPhase = ''
-                NO_COLOR=1 # prevent escape codes from messing up the `nix log`
-                PACKAGE_DIR=${pkgs.callPackage ./deps.nix {zig = zig;}}
-                zig build install --global-cache-dir $(pwd)/.cache --system $PACKAGE_DIR -Dtarget=${target} -Doptimize=ReleaseSafe --prefix $out
+                PACKAGE_DIR=${pkgs.callPackage ./deps.nix {}}
+                zig build install --system $PACKAGE_DIR -Dtarget=${target} -Doptimize=ReleaseSafe --color off --prefix $out
               '';
               checkPhase = ''
-                zig build test --global-cache-dir $(pwd)/.cache --system $PACKAGE_DIR -Dtarget=${target}
+                zig build test --system $PACKAGE_DIR -Dtarget=${target} --color off
               '';
             };
           };

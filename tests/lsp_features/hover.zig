@@ -3,10 +3,83 @@ const zls = @import("zls");
 
 const Context = @import("../context.zig").Context;
 
-const types = zls.types;
+const types = zls.lsp.types;
 const offsets = zls.offsets;
 
 const allocator: std.mem.Allocator = std.testing.allocator;
+
+test "primitive" {
+    try testHover(
+        \\const foo = bool<cursor>;
+    ,
+        \\```zig
+        \\bool
+        \\```
+        \\```zig
+        \\(type)
+        \\```
+    );
+    try testHover(
+        \\const foo = true<cursor>;
+    ,
+        \\```zig
+        \\true
+        \\```
+        \\```zig
+        \\(bool)
+        \\```
+    );
+    try testHover(
+        \\const foo = c_int<cursor>;
+    ,
+        \\```zig
+        \\c_int
+        \\```
+        \\```zig
+        \\(type)
+        \\```
+    );
+    try testHover(
+        \\const foo = f32<cursor>;
+    ,
+        \\```zig
+        \\f32
+        \\```
+        \\```zig
+        \\(type)
+        \\```
+    );
+    try testHover(
+        \\const foo = i64<cursor>;
+    ,
+        \\```zig
+        \\i64
+        \\```
+        \\```zig
+        \\(type)
+        \\```
+    );
+    try testHover(
+        \\const foo = null<cursor>;
+    ,
+        \\```zig
+        \\null
+        \\```
+        \\```zig
+        \\(@TypeOf(null))
+        \\```
+    );
+    try testHover(
+        \\const foo = undefined<cursor>;
+    ,
+        \\```zig
+        \\undefined
+        \\```
+        \\```zig
+        \\(@TypeOf(undefined))
+        \\```
+    );
+}
 
 test "char literal" {
     try testHover(
@@ -201,8 +274,6 @@ test "struct" {
         \\    };
         \\};
     ,
-        \\ Foo doc comment
-        \\
         \\```zig
         \\const FooStruct = struct {
         \\    bar: u32,
@@ -213,6 +284,8 @@ test "struct" {
         \\```zig
         \\(type)
         \\```
+        \\
+        \\Foo doc comment
     );
     try testHover(
         \\const Edge<cursor>Cases = struct {
@@ -239,6 +312,62 @@ test "struct" {
         \\```zig
         \\(u32)
         \\```
+    );
+    try testHover(
+        \\const S = struct { foo: u32 };
+        \\const foo = (S{ .foo = 0 }).<cursor>foo;
+    ,
+        \\```zig
+        \\u32
+        \\```
+        \\```zig
+        \\(u32)
+        \\```
+    );
+}
+
+test "root struct" {
+    try testHover(
+        \\const f<cursor>oo: @This() = .{};
+    ,
+        \\```zig
+        \\const foo: @This() = .{}
+        \\```
+        \\```zig
+        \\(test)
+        \\```
+        \\
+        \\Go to [test](file:///test.zig#L1)
+    );
+}
+
+test "inferred struct init" {
+    try testHover(
+        \\const S = struct { foo: u32 };
+        \\const foo: S = .<cursor>{ .foo = 0 };
+    ,
+        \\```zig
+        \\S
+        \\```
+        \\```zig
+        \\(type)
+        \\```
+        \\
+        \\Go to [S](file:///test.zig#L1)
+    );
+    try testHover(
+        \\const S = struct { foo: u32 };
+        \\fn f(_: S) void {}
+        \\const foo = f(<cursor>.{ .foo = 0 });
+    ,
+        \\```zig
+        \\S
+        \\```
+        \\```zig
+        \\(type)
+        \\```
+        \\
+        \\Go to [S](file:///test.zig#L1)
     );
 }
 
@@ -277,6 +406,9 @@ test "decl literal function" {
         \\```zig
         \\fn foo() S
         \\```
+        \\```zig
+        \\(fn () S)
+        \\```
         \\
         \\Go to [S](file:///test.zig#L1)
     );
@@ -291,6 +423,9 @@ test "decl literal function" {
     ,
         \\```zig
         \\fn foo() !S
+        \\```
+        \\```zig
+        \\(fn () !S)
         \\```
         \\
         \\Go to [S](file:///test.zig#L1)
@@ -308,6 +443,9 @@ test "decl literal function" {
     ,
         \\```zig
         \\fn init() Inner
+        \\```
+        \\```zig
+        \\(fn () Inner)
         \\```
         \\
         \\Go to [Inner](file:///test.zig#L1)
@@ -330,10 +468,34 @@ test "decl literal on generic type" {
         \\const init: @This() = undefined
         \\```
         \\```zig
-        \\(Box)
+        \\(Box(u8))
         \\```
         \\
-        \\Go to [@This()](file:///test.zig#L1)
+        \\Go to [Box](file:///test.zig#L1)
+    );
+}
+
+test "decl literal on generic type - alias" {
+    try testHover(
+        \\fn Box(comptime T: type) type {
+        \\    return struct {
+        \\        item: T,
+        \\        const init: @This() = undefined;
+        \\        const alias = init;
+        \\    };
+        \\}
+        \\test {
+        \\    const box: Box(u8) = .al<cursor>ias;
+        \\}
+    ,
+        \\```zig
+        \\const init: @This() = undefined
+        \\```
+        \\```zig
+        \\(Box(u8))
+        \\```
+        \\
+        \\Go to [Box](file:///test.zig#L1)
     );
 }
 
@@ -427,6 +589,28 @@ test "enum member" {
     );
 }
 
+test "generic type" {
+    try testHover(
+        \\const StructType = struct {};
+        \\const EnumType = enum {};
+        \\fn GenericType(A: type, B: type) type {
+        \\    _ = .{ A, B };
+        \\    return struct {};
+        \\}
+        \\const T = GenericType(StructType, EnumType);
+        \\const t<cursor>: T = .{};
+    ,
+        \\```zig
+        \\const t: T = .{}
+        \\```
+        \\```zig
+        \\(GenericType(StructType,EnumType))
+        \\```
+        \\
+        \\Go to [GenericType](file:///test.zig#L3) | [StructType](file:///test.zig#L1) | [EnumType](file:///test.zig#L2)
+    );
+}
+
 test "block label" {
     try testHover(
         \\const foo: i32 = undefined;
@@ -483,6 +667,9 @@ test "function" {
         \\```zig
         \\fn foo(a: A, b: B) E!C
         \\```
+        \\```zig
+        \\(fn (A, B) error{A,B}!C)
+        \\```
         \\
         \\Go to [A](file:///test.zig#L1) | [B](file:///test.zig#L2) | [C](file:///test.zig#L3)
     );
@@ -494,8 +681,22 @@ test "function" {
         \\```zig
         \\fn foo(a: S, b: S) E!S
         \\```
+        \\```zig
+        \\(fn (S, S) error{A,B}!S)
+        \\```
         \\
         \\Go to [S](file:///test.zig#L1)
+    );
+    try testHover(
+        \\const E = error { A, B, C };
+        \\fn f<cursor>oo() E!void {}
+    ,
+        \\```zig
+        \\fn foo() E!void
+        \\```
+        \\```zig
+        \\(fn () error{...}!void)
+        \\```
     );
     try testHover(
         \\fn foo(b<cursor>ar: enum { fizz, buzz }) void {}
@@ -513,6 +714,9 @@ test "function" {
         \\```zig
         \\fn foo() !i32
         \\```
+        \\```zig
+        \\(fn () !i32)
+        \\```
     );
     try testHover(
         \\extern fn f<cursor>oo(u32) void;
@@ -520,11 +724,15 @@ test "function" {
         \\```zig
         \\fn foo(u32) void
         \\```
+        \\```zig
+        \\(fn (u32) void)
+        \\```
     );
     try testHoverWithOptions(
         \\fn f<cursor>oo() i32 {}
     ,
         \\fn foo() i32
+        \\(fn () i32)
     , .{ .markup_kind = .plaintext });
 }
 
@@ -537,14 +745,14 @@ test "function parameter" {
         \\    return a;
         \\}
     ,
-        \\ hello world
-        \\
         \\```zig
         \\a: u32
         \\```
         \\```zig
         \\(u32)
         \\```
+        \\
+        \\hello world
     );
 }
 
@@ -561,84 +769,6 @@ test "optional" {
         \\```
         \\
         \\Go to [S](file:///test.zig#L1)
-    );
-
-    try testHover(
-        \\const foo: ?i32 = 5;
-        \\const b<cursor>ar = foo orelse 0;
-    ,
-        \\```zig
-        \\const bar = foo orelse 0
-        \\```
-        \\```zig
-        \\(i32)
-        \\```
-    );
-
-    try testHover(
-        \\const foo: ?i32 = 5;
-        \\const b<cursor>ar = foo orelse foo;
-    ,
-        \\```zig
-        \\const bar = foo orelse foo
-        \\```
-        \\```zig
-        \\(?i32)
-        \\```
-    );
-
-    try testHover(
-        \\const foo: ?i32 = 5;
-        \\const b<cursor>ar = foo orelse unreachable;
-    ,
-        \\```zig
-        \\const bar = foo orelse unreachable
-        \\```
-        \\```zig
-        \\(i32)
-        \\```
-    );
-
-    try testHover(
-        \\fn foo(a: ?i32) void {
-        \\    const b<cursor>ar = a orelse return;
-        \\}
-    ,
-        \\```zig
-        \\const bar = a orelse return
-        \\```
-        \\```zig
-        \\(i32)
-        \\```
-    );
-
-    try testHover(
-        \\fn foo() void {
-        \\    const array: [1]?i32 = [1]?i32{ 4 };
-        \\    for (array) |elem| {
-        \\        const b<cursor>ar = elem orelse continue;
-        \\    }
-        \\}
-    ,
-        \\```zig
-        \\const bar = elem orelse continue
-        \\```
-        \\```zig
-        \\(i32)
-        \\```
-    );
-
-    try testHover(
-        \\var value: u32 = 123;
-        \\const ptr: [*c]u32 = &value;
-        \\const f<cursor>oo = ptr orelse unreachable;
-    ,
-        \\```zig
-        \\const foo = ptr orelse unreachable
-        \\```
-        \\```zig
-        \\([*c]u32)
-        \\```
     );
 }
 
@@ -672,8 +802,6 @@ test "either types" {
         \\const either = if (undefined) A else B;
         \\const bar = either.<cursor>T;
     ,
-        \\small type
-        \\
         \\```zig
         \\const T = u32
         \\```
@@ -681,7 +809,7 @@ test "either types" {
         \\(type)
         \\```
         \\
-        \\large type
+        \\small type
         \\
         \\```zig
         \\const T = u64
@@ -689,6 +817,8 @@ test "either types" {
         \\```zig
         \\(type)
         \\```
+        \\
+        \\large type
     );
     try testHoverWithOptions(
         \\const A = struct {
@@ -702,15 +832,167 @@ test "either types" {
         \\const either = if (undefined) A else B;
         \\const bar = either.<cursor>T;
     ,
-        \\small type
-        \\
         \\const T = u32
         \\(type)
         \\
-        \\large type
+        \\small type
         \\
         \\const T = u64
         \\(type)
+        \\
+        \\large type
+    , .{ .markup_kind = .plaintext });
+}
+
+test "either type instances" {
+    try testHoverWithOptions(
+        \\const EitherType<cursor> = if (undefined) u32 else f64;
+    ,
+        \\const EitherType = if (undefined) u32 else f64
+        \\(type)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const EitherType = if (undefined) u32 else f64;
+        \\const either<cursor>: EitherType = undefined;
+    ,
+        \\const either: EitherType = undefined
+        \\(u32)
+        \\(f64)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const EitherType = if (undefined) u32 else f64;
+        \\const either<cursor>: *EitherType = undefined;
+    ,
+        \\const either: *EitherType = undefined
+        \\(*u32)
+        \\(*f64)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const EitherType = if (undefined) u32 else f64;
+        \\const either<cursor>: [3]EitherType = undefined;
+    ,
+        \\const either: [3]EitherType = undefined
+        \\([3]u32)
+        \\([3]f64)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const EitherType = if (undefined) u32 else f64;
+        \\const either<cursor>: struct { EitherType } = undefined;
+    ,
+        \\const either: struct { EitherType } = undefined
+        \\(struct { u32 })
+        \\(struct { f64 })
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const EitherType = if (undefined) u32 else f64;
+        \\const either<cursor>: ?EitherType = undefined;
+    ,
+        \\const either: ?EitherType = undefined
+        \\(?u32)
+        \\(?f64)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const EitherError = if (undefined) error{Foo} else error{Bar};
+        \\const EitherType = if (undefined) u32 else f64;
+        \\const either<cursor>: EitherError!EitherType = undefined;
+    ,
+        \\const either: EitherError!EitherType = undefined
+        \\(error{Foo}!u32)
+        \\(error{Foo}!f64)
+        \\(error{Bar}!u32)
+        \\(error{Bar}!f64)
+    , .{
+        .markup_kind = .plaintext,
+        .max_conditional_combos = 4,
+    });
+    try testHoverWithOptions(
+        \\fn GenericStruct(T: type) type {
+        \\    return struct { field: T };
+        \\}
+        \\const EitherType = if (undefined) u32 else f64;
+        \\const either<cursor>: GenericStruct(EitherType) = undefined;
+    ,
+        \\const either: GenericStruct(EitherType) = undefined
+        \\(GenericStruct(u32))
+        \\(GenericStruct(f64))
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const EitherType = if (undefined) u32 else f64;
+        \\fn function<cursor>() EitherType {}
+    ,
+        \\fn function() EitherType
+        \\(fn () u32)
+        \\(fn () f64)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const EitherType = if (undefined) u32 else f64;
+        \\fn function<cursor>(_: EitherType) void {}
+    ,
+        \\fn function(_: EitherType) void
+        \\(fn (u32) void)
+        \\(fn (f64) void)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const EitherType = if (undefined) u32 else f64;
+        \\fn function<cursor>(_: EitherType) EitherType {}
+    ,
+        \\fn function(_: EitherType) EitherType
+        \\(fn (u32) u32)
+        \\(fn (f64) f64)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const foo<cursor> = switch (undefined) {
+        \\    .a => 42,
+        \\    .b => true,
+        \\    .c => 3.14,
+        \\    .d => {},
+        \\    .e => error.Foo,
+        \\};
+    ,
+        \\const foo = switch (undefined) {
+        \\    .a => 42,
+        \\    .b => true,
+        \\    .c => 3.14,
+        \\    .d => {},
+        \\    .e => error.Foo,
+        \\}
+        \\(comptime_int)
+        \\(bool)
+        \\(comptime_float)
+        \\(...)
+    , .{ .markup_kind = .plaintext });
+}
+
+test "either type instances - big" {
+    try testHoverWithOptions(
+        \\const foo = if (true) 1 else true;
+        \\const bar<cursor> = if (true)
+        \\    .{ foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo }
+        \\else
+        \\    .{ foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo };
+    ,
+        \\const bar = if (true)
+        \\    .{ foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo }
+        \\else
+        \\    .{ foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo, foo }
+        \\(struct { comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int, comptime_int })
+        \\(struct { bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool })
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const a = if (true) 1 else true;
+        \\const b = if (true) false else 0;
+        \\const c = if (true) .{ a, b } else .{ b, a };
+        \\const d = if (true) .{ a, c } else .{ b, c };
+        \\const e = if (true) .{ c, d } else .{ d, c };
+        \\const f = if (true) .{ d, e } else .{ e, d };
+        \\const g = if (true) .{ e, f } else .{ f, e };
+        \\const h<cursor> = if (true) .{ f, g } else .{ g, f };
+    ,
+        \\const h = if (true) .{ f, g } else .{ g, f }
+        \\(struct { struct { struct { comptime_int, struct { comptime_int, bool } }, struct { struct { comptime_int, bool }, struct { comptime_int, struct { comptime_int, bool } } } }, struct { struct { struct { comptime_int, bool }, struct { comptime_int, struct { comptime_int, bool } } }, struct { struct { comptime_int, struct { comptime_int, bool } }, struct { struct { comptime_int, bool }, struct { comptime_int, struct { comptime_int, bool } } } } } })
+        \\(struct { struct { struct { bool, struct { comptime_int, bool } }, struct { struct { comptime_int, bool }, struct { comptime_int, struct { comptime_int, bool } } } }, struct { struct { struct { comptime_int, bool }, struct { comptime_int, struct { comptime_int, bool } } }, struct { struct { comptime_int, struct { comptime_int, bool } }, struct { struct { comptime_int, bool }, struct { comptime_int, struct { comptime_int, bool } } } } } })
+        \\(struct { struct { struct { comptime_int, struct { bool, bool } }, struct { struct { comptime_int, bool }, struct { comptime_int, struct { comptime_int, bool } } } }, struct { struct { struct { comptime_int, bool }, struct { comptime_int, struct { comptime_int, bool } } }, struct { struct { comptime_int, struct { comptime_int, bool } }, struct { struct { comptime_int, bool }, struct { comptime_int, struct { comptime_int, bool } } } } } })
+        \\(...)
     , .{ .markup_kind = .plaintext });
 }
 
@@ -719,14 +1001,14 @@ test "var decl comments" {
         \\///this is a comment
         \\const f<cursor>oo = 0 + 0;
     ,
-        \\this is a comment
-        \\
         \\```zig
         \\const foo = 0 + 0
         \\```
         \\```zig
-        \\(unknown)
+        \\(comptime_int)
         \\```
+        \\
+        \\this is a comment
     );
 }
 
@@ -737,6 +1019,9 @@ test "var decl alias" {
     ,
         \\```zig
         \\fn foo() void
+        \\```
+        \\```zig
+        \\(fn () void)
         \\```
     );
     try testHover(
@@ -752,8 +1037,18 @@ test "var decl alias" {
     );
 }
 
+test "alias with different type" {
+    try testHoverWithOptions(
+        \\const foo: i32 = 1;
+        \\const bar<cursor>: ?i32 = foo;
+    ,
+        \\const foo: i32 = 1
+        \\(?i32)
+    , .{ .markup_kind = .plaintext });
+}
+
 test "escaped identifier" {
-    try testHover(
+    try testHoverWithOptions(
         \\const @"f<cursor>oo" = 42;
     ,
         \\```zig
@@ -762,8 +1057,11 @@ test "escaped identifier" {
         \\```zig
         \\(comptime_int)
         \\```
-    );
-    try testHover(
+    , .{
+        .highlight = "@\"foo\"",
+        .markup_kind = .markdown,
+    });
+    try testHoverWithOptions(
         \\const @"hello <cursor> world" = 42;
     ,
         \\```zig
@@ -772,8 +1070,11 @@ test "escaped identifier" {
         \\```zig
         \\(comptime_int)
         \\```
-    );
-    try testHover(
+    , .{
+        .highlight = "@\"hello  world\"",
+        .markup_kind = .markdown,
+    });
+    try testHoverWithOptions(
         \\const @<cursor>"hello  world" = 42;
     ,
         \\```zig
@@ -782,7 +1083,58 @@ test "escaped identifier" {
         \\```zig
         \\(comptime_int)
         \\```
-    );
+    , .{
+        .highlight = "@\"hello  world\"",
+        .markup_kind = .markdown,
+    });
+}
+
+test "escaped identifier with same name as primitive" {
+    try testHoverWithOptions(
+        \\const @"true"<cursor> = 42;
+    ,
+        \\```zig
+        \\const @"true" = 42
+        \\```
+        \\```zig
+        \\(comptime_int)
+        \\```
+    , .{
+        .highlight = "@\"true\"",
+        .markup_kind = .markdown,
+    });
+    try testHoverWithOptions(
+        \\const @"f32"<cursor> = 42;
+    ,
+        \\```zig
+        \\const @"f32" = 42
+        \\```
+        \\```zig
+        \\(comptime_int)
+        \\```
+    , .{
+        .highlight = "@\"f32\"",
+        .markup_kind = .markdown,
+    });
+}
+
+test "escaped identifier in enum literal" {
+    try testHoverWithOptions(
+        \\const E = enum { @"hello world" };
+        \\const e: E = .@"hello world"<cursor>;
+    ,
+        \\```zig
+        \\@"hello world"
+        \\```
+        \\```zig
+        \\(E)
+        \\```
+        \\
+        \\Go to [E](file:///test.zig#L1)
+    , .{
+        .highlight = "@\"hello world\"",
+        .markup_kind = .markdown,
+    });
 }
 
 // https://github.com/zigtools/zls/issues/1378
@@ -800,6 +1152,9 @@ test "type reference cycle" {
         \\    alpha: anytype,
         \\    beta: @TypeOf(alpha),
         \\) void
+        \\```
+        \\```zig
+        \\(fn (anytype, anytype) void)
         \\```
     );
 }
@@ -826,16 +1181,16 @@ test "combine doc comments of declaration and definition" {
         \\    const baz = struct {};
         \\};
     ,
-        \\ Foo
-        \\
-        \\ Bar
-        \\
         \\```zig
         \\const baz = struct
         \\```
         \\```zig
         \\(type)
         \\```
+        \\
+        \\Foo
+        \\
+        \\Bar
     );
     try testHoverWithOptions(
         \\/// Foo
@@ -845,12 +1200,12 @@ test "combine doc comments of declaration and definition" {
         \\    const baz = struct {};
         \\};
     ,
-        \\ Foo
-        \\
-        \\ Bar
-        \\
         \\const baz = struct
         \\(type)
+        \\
+        \\Foo
+        \\
+        \\Bar
     , .{ .markup_kind = .plaintext });
 }
 
@@ -861,16 +1216,16 @@ test "top-level doc comment" {
         \\/// A
         \\const S<cursor>elf = @This();
     ,
-        \\ A
-        \\
-        \\ B
-        \\
         \\```zig
         \\const Self = @This()
         \\```
         \\```zig
         \\(type)
         \\```
+        \\
+        \\A
+        \\
+        \\B
     );
 }
 
@@ -887,6 +1242,109 @@ test "deprecated" {
     );
 }
 
+test "slice properties" {
+    try testHoverWithOptions(
+        \\const foo: []const u8 = undefined;
+        \\const bar = foo.len<cursor>;
+    ,
+        \\len
+        \\(usize)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const foo: []const u8 = undefined;
+        \\const bar = foo.ptr<cursor>;
+    ,
+        \\ptr
+        \\([*]const u8)
+    , .{ .markup_kind = .plaintext });
+}
+
+test "array properties" {
+    try testHoverWithOptions(
+        \\const foo: [3]u8 = undefined;
+        \\const bar = foo.len<cursor>;
+    ,
+        \\len
+        \\(usize)
+    , .{ .markup_kind = .plaintext });
+}
+
+test "tuple properties" {
+    try testHoverWithOptions(
+        \\const foo: struct { i32, bool } = undefined;
+        \\const bar = foo.len<cursor>;
+    ,
+        \\len
+        \\(usize)
+    , .{ .markup_kind = .plaintext });
+    try testHoverWithOptions(
+        \\const foo: struct { i32, bool } = undefined;
+        \\const bar = foo.@"0"<cursor>;
+    ,
+        \\@"0"
+        \\(i32)
+    , .{
+        .highlight = "@\"0\"",
+        .markup_kind = .plaintext,
+    });
+    try testHoverWithOptions(
+        \\const foo: struct { i32, bool } = undefined;
+        \\const bar = foo.@"1"<cursor>;
+    ,
+        \\@"1"
+        \\(bool)
+    , .{
+        .highlight = "@\"1\"",
+        .markup_kind = .plaintext,
+    });
+}
+
+test "optional unwrap" {
+    try testHoverWithOptions(
+        \\const foo: ?f64 = undefined;
+        \\const bar = foo.?<cursor>;
+    ,
+        \\?
+        \\(f64)
+    , .{
+        .highlight = "?",
+        .markup_kind = .plaintext,
+    });
+    try testHoverWithOptions(
+        \\const foo: ?f64 = undefined;
+        \\const bar = foo.<cursor>?;
+    ,
+        \\?
+        \\(f64)
+    , .{
+        .highlight = "?",
+        .markup_kind = .plaintext,
+    });
+}
+
+test "pointer dereference" {
+    try testHoverWithOptions(
+        \\const foo: *f64 = undefined;
+        \\const bar = foo.*<cursor>;
+    ,
+        \\*
+        \\(f64)
+    , .{
+        .highlight = "*",
+        .markup_kind = .plaintext,
+    });
+    try testHoverWithOptions(
+        \\const foo: *f64 = undefined;
+        \\const bar = foo.<cursor>*;
+    ,
+        \\*
+        \\(f64)
+    , .{
+        .highlight = "*",
+        .markup_kind = .plaintext,
+    });
+}
+
 fn testHover(source: []const u8, expected: []const u8) !void {
     try testHoverWithOptions(source, expected, .{ .markup_kind = .markdown });
 }
@@ -894,7 +1352,11 @@ fn testHover(source: []const u8, expected: []const u8) !void {
 fn testHoverWithOptions(
     source: []const u8,
     expected: []const u8,
-    options: struct { markup_kind: types.MarkupKind },
+    options: struct {
+        markup_kind: types.MarkupKind,
+        max_conditional_combos: usize = 3,
+        highlight: ?[]const u8 = null,
+    },
 ) !void {
     const cursor_idx = std.mem.indexOf(u8, source, "<cursor>").?;
     const text = try std.mem.concat(allocator, u8, &.{ source[0..cursor_idx], source[cursor_idx + "<cursor>".len ..] });
@@ -903,19 +1365,28 @@ fn testHoverWithOptions(
     var ctx: Context = try .init();
     defer ctx.deinit();
 
-    ctx.server.client_capabilities.hover_supports_md = options.markup_kind == .markdown;
+    const server = ctx.server;
+    const arena = ctx.arena.allocator();
 
     const uri = try ctx.addDocument(.{
         .uri = "file:///test.zig",
         .source = text,
     });
+    const handle = server.document_store.getHandle(uri).?;
 
-    const params: types.HoverParams = .{
-        .textDocument = .{ .uri = uri },
-        .position = offsets.indexToPosition(text, cursor_idx, ctx.server.offset_encoding),
-    };
+    var analyser = server.initAnalyser(arena, handle);
+    defer analyser.deinit();
 
-    const response: types.Hover = try ctx.server.sendRequestSync(ctx.arena.allocator(), "textDocument/hover", params) orelse {
+    analyser.max_conditional_combos = options.max_conditional_combos;
+
+    const response = try zls.hover.hover(
+        &analyser,
+        arena,
+        handle,
+        cursor_idx,
+        options.markup_kind,
+        server.offset_encoding,
+    ) orelse {
         if (expected.len == 0) return;
         std.debug.print("Server returned `null` as the result\n", .{});
         return error.InvalidResponse;
@@ -924,5 +1395,9 @@ fn testHoverWithOptions(
     const markup_context = response.contents.MarkupContent;
 
     try std.testing.expectEqual(options.markup_kind, markup_context.kind);
-    try std.testing.expectEqualStrings(expected, markup_context.value);
+    try zls.testing.expectEqualStrings(expected, markup_context.value);
+    if (options.highlight) |expected_higlight| {
+        const actual_highlight = offsets.rangeToSlice(text, response.range.?, ctx.server.offset_encoding);
+        try std.testing.expectEqualStrings(expected_higlight, actual_highlight);
+    }
 }

@@ -4,7 +4,7 @@ const zls = @import("zls");
 const Context = @import("../context.zig").Context;
 const helper = @import("../helper.zig");
 
-const types = zls.types;
+const types = zls.lsp.types;
 const offsets = zls.offsets;
 
 const allocator: std.mem.Allocator = std.testing.allocator;
@@ -482,12 +482,89 @@ test "organize imports - bubbles up" {
         \\const std = @import("std");
         \\fn main() void {}
         \\const abc = @import("abc.zig");
+        \\fn foo() void {}
     ,
         \\const std = @import("std");
         \\
         \\const abc = @import("abc.zig");
         \\
         \\fn main() void {}
+        \\fn foo() void {}
+    );
+}
+
+test "organize imports - bottom placement" {
+    // When imports are at the bottom, they should stay at the bottom
+    try testOrganizeImports(
+        \\fn main() void {
+        \\    std.debug.print("Hello\n", .{});
+        \\}
+        \\
+        \\const xyz = @import("xyz.zig");
+        \\const abc = @import("abc.zig");
+        \\const std = @import("std");
+    ,
+        \\fn main() void {
+        \\    std.debug.print("Hello\n", .{});
+        \\}
+        \\
+        \\
+        \\const std = @import("std");
+        \\
+        \\const abc = @import("abc.zig");
+        \\const xyz = @import("xyz.zig");
+        \\
+        \\
+    );
+}
+
+test "organize imports - bottom placement with multiple functions" {
+    // Bottom imports with multiple declarations
+    try testOrganizeImports(
+        \\fn foo() void {}
+        \\
+        \\fn bar() void {}
+        \\
+        \\const test_input = "test";
+        \\
+        \\const xyz = @import("xyz.zig");
+        \\const abc = @import("abc.zig");
+        \\const std = @import("std");
+    ,
+        \\fn foo() void {}
+        \\
+        \\fn bar() void {}
+        \\
+        \\const test_input = "test";
+        \\
+        \\
+        \\const std = @import("std");
+        \\
+        \\const abc = @import("abc.zig");
+        \\const xyz = @import("xyz.zig");
+        \\
+        \\
+    );
+}
+
+test "organize imports - mixed placement defaults to bottom" {
+    // When imports are mixed (both top and bottom), consolidate at bottom
+    try testOrganizeImports(
+        \\const std = @import("std");
+        \\
+        \\fn main() void {}
+        \\
+        \\const xyz = @import("xyz.zig");
+        \\const abc = @import("abc.zig");
+    ,
+        \\fn main() void {}
+        \\
+        \\
+        \\const std = @import("std");
+        \\
+        \\const abc = @import("abc.zig");
+        \\const xyz = @import("xyz.zig");
+        \\
         \\
     );
 }
@@ -620,11 +697,12 @@ test "organize imports - @embedFile" {
     try testOrganizeImports(
         \\const foo = @embedFile("foo.zig");
         \\const abc = @import("abc.zig");
+        \\const bar = @embedFile("bar.zig");
     ,
         \\const abc = @import("abc.zig");
         \\
         \\const foo = @embedFile("foo.zig");
-        \\
+        \\const bar = @embedFile("bar.zig");
     );
 }
 
@@ -857,7 +935,7 @@ fn testDiagnostic(
 ) !void {
     var ctx: Context = try .init();
     defer ctx.deinit();
-    ctx.server.config.prefer_ast_check_as_child_process = !options.want_zir;
+    ctx.server.config_manager.config.prefer_ast_check_as_child_process = !options.want_zir;
 
     var phr = try helper.collectClearPlaceholders(allocator, before);
     defer phr.deinit(allocator);
@@ -894,7 +972,7 @@ fn testDiagnostic(
         return error.InvalidResponse;
     };
 
-    var text_edits: std.ArrayListUnmanaged(types.TextEdit) = .empty;
+    var text_edits: std.ArrayList(types.TextEdit) = .empty;
     defer text_edits.deinit(allocator);
 
     for (response) |action| {
@@ -918,7 +996,7 @@ fn testDiagnostic(
 
     const actual = try zls.diff.applyTextEdits(allocator, source, text_edits.items, ctx.server.offset_encoding);
     defer allocator.free(actual);
-    try ctx.server.document_store.refreshDocument(uri, try allocator.dupeZ(u8, actual));
+    try ctx.server.document_store.refreshLspSyncedDocument(uri, try allocator.dupeZ(u8, actual));
 
     try std.testing.expectEqualStrings(after, handle.tree.source);
 }

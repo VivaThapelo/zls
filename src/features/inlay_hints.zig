@@ -154,7 +154,7 @@ const Builder = struct {
     analyser: *Analyser,
     config: *const Config,
     handle: *DocumentStore.Handle,
-    hints: std.ArrayListUnmanaged(InlayHint) = .empty,
+    hints: std.ArrayList(InlayHint) = .empty,
     hover_kind: types.MarkupKind,
 
     fn appendParameterHint(
@@ -237,28 +237,16 @@ fn writeCallHint(
 
     const ty = try builder.analyser.resolveTypeOfNode(.of(call.ast.fn_expr, handle)) orelse return;
     const fn_ty = try builder.analyser.resolveFuncProtoOfCallable(ty) orelse return;
-    const fn_node = fn_ty.data.other; // this assumes that function types can only be Ast nodes
+    const fn_info = fn_ty.data.function;
 
-    var buffer: [1]Ast.Node.Index = undefined;
-    const fn_proto = fn_node.handle.tree.fullFnProto(&buffer, fn_node.node).?;
-
-    var params: std.ArrayListUnmanaged(Ast.full.FnProto.Param) = try .initCapacity(builder.arena, fn_proto.ast.params.len);
-    defer params.deinit(builder.arena);
-
-    var it = fn_proto.iterate(&fn_node.handle.tree);
-    while (ast.nextFnParam(&it)) |param| {
-        try params.append(builder.arena, param);
-    }
-
-    const has_self_param = call.ast.params.len + 1 == params.items.len and
+    const has_self_param = call.ast.params.len + 1 == fn_info.parameters.len and
         try builder.analyser.isInstanceCall(handle, call, fn_ty);
 
-    const parameters = params.items[@intFromBool(has_self_param)..];
+    const parameters = fn_info.parameters[@intFromBool(has_self_param)..];
     const arguments = call.ast.params;
     const min_len = @min(parameters.len, arguments.len);
     for (parameters[0..min_len], arguments[0..min_len]) |param, arg| {
-        const parameter_name_token = param.name_token orelse continue;
-        const parameter_name = offsets.identifierTokenToNameSlice(fn_node.handle.tree, parameter_name_token);
+        const parameter_name = param.name orelse continue;
 
         if (builder.config.inlay_hints_hide_redundant_param_names or builder.config.inlay_hints_hide_redundant_param_names_last_token) dont_skip: {
             const arg_token = if (builder.config.inlay_hints_hide_redundant_param_names_last_token)
@@ -275,15 +263,13 @@ fn writeCallHint(
             continue;
         }
 
-        const token_tags = fn_node.handle.tree.tokens.items(.tag);
+        const no_alias = if (param.modifier) |m| m == .noalias_param else false;
+        const comp_time = if (param.modifier) |m| m == .comptime_param else false;
 
-        const no_alias = if (param.comptime_noalias) |t| token_tags[t] == .keyword_noalias or token_tags[t - 1] == .keyword_noalias else false;
-        const comp_time = if (param.comptime_noalias) |t| token_tags[t] == .keyword_comptime or token_tags[t - 1] == .keyword_comptime else false;
-
-        const tooltip = if (param.anytype_ellipsis3) |token|
-            if (token_tags[token] == .keyword_anytype) "anytype" else ""
-        else
-            offsets.nodeToSlice(fn_node.handle.tree, param.type_expr.?);
+        const tooltip = try param.type.stringifyTypeVal(
+            builder.analyser,
+            .{ .truncate_container_decls = true },
+        );
 
         try builder.appendParameterHint(
             handle.tree.nodeTag(arg),
@@ -296,26 +282,28 @@ fn writeCallHint(
     }
 }
 
-/// takes parameter nodes from the ast and function parameter names from `Builtin.arguments` and writes parameter hints into `builder.hints`
-fn writeBuiltinHint(builder: *Builder, parameters: []const Ast.Node.Index, arguments: []const []const u8) !void {
+/// takes parameter nodes from the ast and function parameter names from `Builtin.parameters` and writes parameter hints into `builder.hints`
+fn writeBuiltinHint(builder: *Builder, parameters: []const Ast.Node.Index, params: []const data.Builtin.Parameter) !void {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
     const handle = builder.handle;
     const tree = handle.tree;
 
-    const len = @min(arguments.len, parameters.len);
-    for (arguments[0..len], parameters[0..len]) |arg, parameter| {
-        if (arg.len == 0) continue;
+    const len = @min(params.len, parameters.len);
+    for (params[0..len], parameters[0..len]) |param, parameter| {
+        const signature = param.signature;
+        if (signature.len == 0) continue;
 
-        const colonIndex = std.mem.indexOfScalar(u8, arg, ':');
-        const type_expr: []const u8 = if (colonIndex) |index| arg[index + 1 ..] else &.{};
+        const colonIndex = std.mem.indexOfScalar(u8, signature, ':');
+        const type_expr = param.type orelse "";
 
+        // TODO: parse noalias/comptime/label in config_gen.zig
         var maybe_label: ?[]const u8 = null;
         var no_alias = false;
         var comp_time = false;
 
-        var it = std.mem.splitScalar(u8, arg[0 .. colonIndex orelse arg.len], ' ');
+        var it = std.mem.splitScalar(u8, signature[0 .. colonIndex orelse signature.len], ' ');
         while (it.next()) |item| {
             if (item.len == 0) continue;
             maybe_label = item;
@@ -340,15 +328,10 @@ fn writeBuiltinHint(builder: *Builder, parameters: []const Ast.Node.Index, argum
 
 fn typeStrOfNode(builder: *Builder, node: Ast.Node.Index) !?[]const u8 {
     const resolved_type = try builder.analyser.resolveTypeOfNode(.of(node, builder.handle)) orelse return null;
-
-    const type_str: []const u8 = try std.fmt.allocPrint(
-        builder.arena,
-        "{}",
-        .{resolved_type.fmt(builder.analyser, .{ .truncate_container_decls = true })},
+    return try resolved_type.stringifyTypeOf(
+        builder.analyser,
+        .{ .truncate_container_decls = true },
     );
-    if (type_str.len == 0) return null;
-
-    return type_str;
 }
 
 fn typeStrOfToken(builder: *Builder, token: Ast.TokenIndex) !?[]const u8 {
@@ -358,15 +341,10 @@ fn typeStrOfToken(builder: *Builder, token: Ast.TokenIndex) !?[]const u8 {
         builder.handle.tree.tokenStart(token),
     ) orelse return null;
     const resolved_type = try things.resolveType(builder.analyser) orelse return null;
-
-    const type_str: []const u8 = try std.fmt.allocPrint(
-        builder.arena,
-        "{}",
-        .{resolved_type.fmt(builder.analyser, .{ .truncate_container_decls = true })},
+    return try resolved_type.stringifyTypeOf(
+        builder.analyser,
+        .{ .truncate_container_decls = true },
     );
-    if (type_str.len == 0) return null;
-
-    return type_str;
 }
 
 /// Append a hint in the form `: hint`
@@ -436,12 +414,8 @@ fn writeNodeInlayHint(
     switch (tree.nodeTag(node)) {
         .call_one,
         .call_one_comma,
-        .async_call_one,
-        .async_call_one_comma,
         .call,
         .call_comma,
-        .async_call,
-        .async_call_comma,
         => {
             if (!builder.config.inlay_hints_show_parameter_name) return;
 
@@ -532,7 +506,7 @@ fn writeNodeInlayHint(
             if (params.len == 0) return;
 
             if (data.builtins.get(name)) |builtin| {
-                try writeBuiltinHint(builder, params, builtin.arguments);
+                try writeBuiltinHint(builder, params, builtin.parameters);
             }
         },
         .struct_init_one,
@@ -553,11 +527,7 @@ fn writeNodeInlayHint(
                 const name = offsets.locToSlice(tree.source, name_loc);
                 const decl = (try builder.analyser.getSymbolEnumLiteral(builder.handle, name_loc.start, name)) orelse continue;
                 const ty = try decl.resolveType(builder.analyser) orelse continue;
-                const type_str: []const u8 = try std.fmt.allocPrint(
-                    builder.arena,
-                    "{}",
-                    .{ty.fmt(builder.analyser, .{ .truncate_container_decls = true })},
-                );
+                const type_str = try ty.stringifyTypeOf(builder.analyser, .{ .truncate_container_decls = true });
                 if (type_str.len == 0) continue;
                 try appendTypeHintString(
                     builder,
@@ -575,7 +545,7 @@ fn writeNodeInlayHint(
 /// only hints in the given loc are created
 pub fn writeRangeInlayHint(
     arena: std.mem.Allocator,
-    config: Config,
+    config: *const Config,
     analyser: *Analyser,
     handle: *DocumentStore.Handle,
     loc: offsets.Loc,
@@ -585,7 +555,7 @@ pub fn writeRangeInlayHint(
     var builder: Builder = .{
         .arena = arena,
         .analyser = analyser,
-        .config = &config,
+        .config = config,
         .handle = handle,
         .hover_kind = hover_kind,
     };

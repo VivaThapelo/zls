@@ -2,14 +2,13 @@
 
 const std = @import("std");
 const zig_builtin = @import("builtin");
-const Config = @import("DocumentStore.zig").Config;
+const DocumentStore = @import("DocumentStore.zig");
 const ast = @import("ast.zig");
 const tracy = @import("tracy");
 const Ast = std.zig.Ast;
 const URI = @import("uri.zig");
 const log = std.log.scoped(.translate_c);
 
-const ZCSTransport = @import("build_runner/shared.zig").Transport;
 const OutMessage = std.zig.Client.Message;
 const InMessage = std.zig.Server.Message;
 
@@ -36,7 +35,7 @@ pub fn convertCInclude(allocator: std.mem.Allocator, tree: Ast, node: Ast.Node.I
     std.debug.assert(ast.isBuiltinCall(tree, node));
     std.debug.assert(std.mem.eql(u8, Ast.tokenSlice(tree, tree.nodeMainToken(node)), "@cImport"));
 
-    var output: std.ArrayListUnmanaged(u8) = .empty;
+    var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
 
     var buffer: [2]Ast.Node.Index = undefined;
@@ -51,10 +50,8 @@ fn convertCIncludeInternal(
     allocator: std.mem.Allocator,
     tree: Ast,
     node: Ast.Node.Index,
-    output: *std.ArrayListUnmanaged(u8),
+    output: *std.ArrayList(u8),
 ) error{ OutOfMemory, Unsupported }!void {
-    var writer = output.writer(allocator);
-
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.blockStatements(&buffer, node)) |statements| {
         for (statements) |statement| {
@@ -69,7 +66,7 @@ fn convertCIncludeInternal(
         const first = extractString(Ast.tokenSlice(tree, tree.nodeMainToken(params[0])));
 
         if (std.mem.eql(u8, call_name, "@cInclude")) {
-            try writer.print("#include <{s}>\n", .{first});
+            try output.print(allocator, "#include <{s}>\n", .{first});
         } else if (std.mem.eql(u8, call_name, "@cDefine")) {
             if (params.len < 2) return;
 
@@ -77,14 +74,14 @@ fn convertCIncludeInternal(
             const is_void = if (tree.blockStatements(&buffer2, params[1])) |block| block.len == 0 else false;
 
             if (is_void) {
-                try writer.print("#define {s}\n", .{first});
+                try output.print(allocator, "#define {s}\n", .{first});
             } else {
                 if (tree.nodeTag(params[1]) != .string_literal) return error.Unsupported;
                 const second = extractString(Ast.tokenSlice(tree, tree.nodeMainToken(params[1])));
-                try writer.print("#define {s} {s}\n", .{ first, second });
+                try output.print(allocator, "#define {s} {s}\n", .{ first, second });
             }
         } else if (std.mem.eql(u8, call_name, "@cUndef")) {
-            try writer.print("#undef {s}\n", .{first});
+            try output.print(allocator, "#undef {s}\n", .{first});
         } else {
             return error.Unsupported;
         }
@@ -111,7 +108,7 @@ pub const Result = union(enum) {
 /// Caller owns returned memory.
 pub fn translate(
     allocator: std.mem.Allocator,
-    config: Config,
+    config: DocumentStore.Config,
     include_dirs: []const []const u8,
     c_macros: []const []const u8,
     source: []const u8,
@@ -120,50 +117,47 @@ pub fn translate(
     defer tracy_zone.end();
 
     const zig_exe_path = config.zig_exe_path.?;
-    const zig_lib_path = config.zig_lib_path.?;
-    const global_cache_path = config.global_cache_path.?;
+    const zig_lib_dir = config.zig_lib_dir.?;
+    const global_cache_dir = config.global_cache_dir.?;
 
     var random_bytes: [16]u8 = undefined;
     std.crypto.random.bytes(&random_bytes);
     var sub_path: [std.fs.base64_encoder.calcSize(16)]u8 = undefined;
     _ = std.fs.base64_encoder.encode(&sub_path, &random_bytes);
 
-    var global_cache_dir = try std.fs.openDirAbsolute(global_cache_path, .{});
-    defer global_cache_dir.close();
-
-    var sub_dir = try global_cache_dir.makeOpenPath(&sub_path, .{});
+    var sub_dir = try global_cache_dir.handle.makeOpenPath(&sub_path, .{});
     defer sub_dir.close();
 
     sub_dir.writeFile(.{
         .sub_path = "cimport.h",
         .data = source,
     }) catch |err| {
-        log.warn("failed to write to '{s}/{s}/cimport.h': {}", .{ global_cache_path, sub_path, err });
+        log.warn("failed to write to '{s}/{s}/cimport.h': {}", .{ global_cache_dir.path orelse ".", sub_path, err });
         return null;
     };
 
-    defer global_cache_dir.deleteTree(&sub_path) catch |err| {
-        log.warn("failed to delete '{s}/{s}': {}", .{ global_cache_path, sub_path, err });
+    defer global_cache_dir.handle.deleteTree(&sub_path) catch |err| {
+        log.warn("failed to delete '{s}/{s}': {}", .{ global_cache_dir.path orelse ".", sub_path, err });
     };
 
-    const file_path = try std.fs.path.join(allocator, &.{ global_cache_path, &sub_path, "cimport.h" });
+    const file_path = try std.fs.path.join(allocator, &.{ global_cache_dir.path orelse ".", &sub_path, "cimport.h" });
     defer allocator.free(file_path);
 
     const base_args = &[_][]const u8{
         zig_exe_path,
         "translate-c",
         "--zig-lib-dir",
-        zig_lib_path,
+        zig_lib_dir.path orelse ".",
         "--cache-dir",
-        global_cache_path,
+        global_cache_dir.path orelse ".",
         "--global-cache-dir",
-        global_cache_path,
+        global_cache_dir.path orelse ".",
         "-lc",
         "--listen=-",
     };
 
     const argc = base_args.len + 2 * include_dirs.len + c_macros.len + 1;
-    var argv: std.ArrayListUnmanaged([]const u8) = try .initCapacity(allocator, argc);
+    var argv: std.ArrayList([]const u8) = try .initCapacity(allocator, argc);
     defer argv.deinit(allocator);
 
     argv.appendSliceAssumeCapacity(base_args);
@@ -193,62 +187,79 @@ pub fn translate(
         log.err("zig translate-c process did not terminate, error: {}", .{wait_err});
     };
 
-    var zcs: ZCSTransport = .init(.{
-        .gpa = allocator,
-        .in = process.stdout.?,
-        .out = process.stdin.?,
-    });
-    defer zcs.deinit();
+    {
+        var stdin_writer = process.stdin.?.writer(&.{});
+        const writer = &stdin_writer.interface;
 
-    try zcs.serveMessage(.{ .tag = @intFromEnum(OutMessage.Tag.update), .bytes_len = 0 }, &.{});
-    try zcs.serveMessage(.{ .tag = @intFromEnum(OutMessage.Tag.exit), .bytes_len = 0 }, &.{});
+        writer.writeStruct(OutMessage.Header{
+            .tag = .update,
+            .bytes_len = 0,
+        }, .little) catch return @as(std.fs.File.WriteError!?Result, stdin_writer.err.?);
+
+        writer.writeStruct(OutMessage.Header{
+            .tag = .exit,
+            .bytes_len = 0,
+        }, .little) catch return @as(std.fs.File.WriteError!?Result, stdin_writer.err.?);
+    }
+
+    var poller = std.Io.poll(allocator, enum { stdout }, .{ .stdout = process.stdout.? });
+    defer poller.deinit();
+    const stdout = poller.reader(.stdout);
 
     while (true) {
-        const header = try zcs.receiveMessage(20 * std.time.ns_per_s);
+        const timeout: u64 = 20 * std.time.ns_per_s;
+
+        while (stdout.buffered().len < @sizeOf(InMessage.Header)) {
+            if (!try poller.pollTimeout(timeout)) return error.EndOfStream;
+        }
+        const header = stdout.takeStruct(InMessage.Header, .little) catch unreachable;
+        while (stdout.buffered().len < header.bytes_len) {
+            if (!try poller.pollTimeout(timeout)) return error.EndOfStream;
+        }
+        const body = stdout.take(header.bytes_len) catch unreachable;
+        var reader: std.Io.Reader = .fixed(body);
+
         // log.debug("received header: {}", .{header});
 
-        switch (@as(InMessage.Tag, @enumFromInt(header.tag))) {
+        switch (header.tag) {
             .zig_version => {
-                // log.debug("zig-version: {s}", .{zcs.receive_fifo.readableSliceOfLen(header.bytes_len)});
-                zcs.discard(header.bytes_len);
+                // log.debug("zig-version: {s}", .{body});
             },
             .emit_digest => {
-                const expected_size: usize = @sizeOf(std.zig.Server.Message.EmitDigest) + 16;
-                if (header.bytes_len != expected_size) return error.InvalidResponse;
+                _ = reader.takeStruct(std.zig.Server.Message.EmitDigest, .little) catch return error.InvalidMessage;
+                const bin_result_path = reader.takeArray(16) catch return error.InvalidMessage;
+                if (reader.bufferedLen() != 0) return error.InvalidMessage; // ensure that we read the entire body
 
-                zcs.discard(@sizeOf(InMessage.EmitDigest));
-
-                const bin_result_path = try zcs.reader().readBytesNoEof(16);
-                const hex_result_path = std.Build.Cache.binToHex(bin_result_path);
-                const result_path = try std.fs.path.join(allocator, &.{ global_cache_path, "o", &hex_result_path, "cimport.zig" });
+                const hex_result_path = std.Build.Cache.binToHex(bin_result_path.*);
+                const result_path = try global_cache_dir.join(allocator, &.{ "o", &hex_result_path, "cimport.zig" });
                 defer allocator.free(result_path);
 
                 return .{ .success = try URI.fromPath(allocator, std.mem.sliceTo(result_path, '\n')) };
             },
             .error_bundle => {
-                if (header.bytes_len < @sizeOf(InMessage.ErrorBundle)) return error.InvalidResponse;
+                const error_bundle_header = reader.takeStruct(InMessage.ErrorBundle, .little) catch return error.InvalidMessage;
 
-                const error_bundle_header: InMessage.ErrorBundle = .{
-                    .extra_len = try zcs.reader().readInt(u32, .little),
-                    .string_bytes_len = try zcs.reader().readInt(u32, .little),
+                const extra = reader.readSliceEndianAlloc(allocator, u32, error_bundle_header.extra_len, .little) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.EndOfStream => return error.InvalidMessage,
+                    error.ReadFailed => unreachable,
                 };
-
-                const expected_size = @sizeOf(InMessage.ErrorBundle) + error_bundle_header.extra_len * @sizeOf(u32) + error_bundle_header.string_bytes_len;
-                if (header.bytes_len != expected_size) return error.InvalidResponse;
-
-                const extra = try zcs.receiveSlice(allocator, u32, error_bundle_header.extra_len);
                 errdefer allocator.free(extra);
 
-                const string_bytes = try zcs.receiveBytes(allocator, error_bundle_header.string_bytes_len);
+                const string_bytes = reader.readAlloc(allocator, error_bundle_header.string_bytes_len) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.EndOfStream => return error.InvalidMessage,
+                    error.ReadFailed => unreachable,
+                };
                 errdefer allocator.free(string_bytes);
+
+                if (reader.bufferedLen() != 0) return error.InvalidMessage; // ensure that we read the entire body
 
                 const error_bundle: std.zig.ErrorBundle = .{ .string_bytes = string_bytes, .extra = extra };
 
                 return .{ .failure = error_bundle };
             },
-            else => {
-                zcs.discard(header.bytes_len);
-            },
+            else => {},
         }
     }
 }
@@ -257,7 +268,9 @@ fn reportTranslateError(allocator: std.mem.Allocator, stderr: ?std.fs.File, argv
     const joined = std.mem.join(allocator, " ", argv) catch return;
     defer allocator.free(joined);
     if (stderr) |file| {
-        const stderr_output = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch return;
+        var buffer: [1024]u8 = undefined;
+        var file_reader = file.readerStreaming(&buffer);
+        const stderr_output = file_reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024)) catch return;
         defer allocator.free(stderr_output);
         log.err("failed zig translate-c command:\n{s}\nstderr:{s}\nerror:{s}\n", .{ joined, stderr_output, err_name });
     } else {

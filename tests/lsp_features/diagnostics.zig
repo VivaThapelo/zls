@@ -5,7 +5,7 @@ const helper = @import("../helper.zig");
 const Context = @import("../context.zig").Context;
 const ErrorBuilder = @import("../ErrorBuilder.zig");
 
-const types = zls.types;
+const types = zls.lsp.types;
 const offsets = zls.offsets;
 
 const allocator: std.mem.Allocator = std.testing.allocator;
@@ -42,8 +42,26 @@ test "ast-check" {
                 .end = .{ .line = 1, .character = 13 },
             },
             .severity = .Error,
+            .tags = &.{.Unnecessary},
             .source = "zls",
             .message = "unused local constant",
+        },
+    }, .{});
+
+    try testDiagnostics(
+        \\test {
+        \\    var foo = undefined;
+        \\}
+    , &.{
+        .{
+            .range = .{
+                .start = .{ .line = 1, .character = 8 },
+                .end = .{ .line = 1, .character = 11 },
+            },
+            .severity = .Error,
+            .tags = &.{.Unnecessary},
+            .source = "zls",
+            .message = "unused local variable",
         },
     }, .{});
 }
@@ -155,13 +173,13 @@ fn testDiagnostics(
         .source = source,
     });
 
-    context.server.config.warn_style = options.warn_style;
-    context.server.config.highlight_global_var_declarations = options.highlight_global_var_declarations;
+    context.server.config_manager.config.warn_style = options.warn_style;
+    context.server.config_manager.config.highlight_global_var_declarations = options.highlight_global_var_declarations;
     context.server.client_capabilities.supports_code_action_fixall = options.autofix;
     context.server.client_capabilities.supports_publish_diagnostics = true;
     try zls.diagnostics.generateDiagnostics(context.server, context.server.document_store.getHandle(uri).?);
 
-    var actual_diagnostics: std.ArrayListUnmanaged(types.Diagnostic) = .empty;
+    var actual_diagnostics: std.ArrayList(types.Diagnostic) = .empty;
 
     try context.server.diagnostics_collection.collectLspDiagnosticsForDocumentTesting(
         uri,

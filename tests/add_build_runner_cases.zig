@@ -7,7 +7,6 @@ pub fn addCases(
     b: *std.Build,
     test_step: *std.Build.Step,
     test_filters: []const []const u8,
-    build_runner: std.Build.LazyPath,
 ) void {
     const cases_dir = b.path("tests/build_runner_cases");
     const cases_path_from_root = b.pathFromRoot("tests/build_runner_cases");
@@ -51,11 +50,13 @@ pub fn addCases(
         build_cmd.addArg("--build-file");
         build_cmd.addFileArg(build_file);
         build_cmd.addArg("--build-runner");
-        build_cmd.addFileArg(build_runner);
+        build_cmd.addFileArg(b.path("src/build_runner/build_runner.zig"));
         build_cmd.addArg("--cache-dir");
-        build_cmd.addDirectoryArg(.{ .cwd_relative = b.fmt("{}", .{b.cache_root}) });
+        build_cmd.addDirectoryArg(.{ .cwd_relative = b.fmt("{f}", .{b.cache_root}) });
         build_cmd.addArg("--global-cache-dir");
-        build_cmd.addDirectoryArg(.{ .cwd_relative = b.fmt("{}", .{b.graph.global_cache_root}) });
+        build_cmd.addDirectoryArg(.{ .cwd_relative = b.fmt("{f}", .{b.graph.global_cache_root}) });
+        build_cmd.addArg("--zig-lib-dir");
+        build_cmd.addDirectoryArg(.{ .cwd_relative = b.fmt("{f}", .{b.graph.zig_lib_directory}) });
 
         const actual_build_config_json = build_cmd.captureStdOut();
 
